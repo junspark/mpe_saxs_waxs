@@ -14,14 +14,14 @@ import midas_config
 
 
 class TestMidasConfig(unittest.TestCase):
+    def setUp(self):
+        self._original_env = os.environ.get("HDF5_PLUGIN_PATH")
+
     def tearDown(self):
         if self._original_env is None:
             os.environ.pop("HDF5_PLUGIN_PATH", None)
         else:
             os.environ["HDF5_PLUGIN_PATH"] = self._original_env
-
-    def setUp(self):
-        self._original_env = os.environ.get("HDF5_PLUGIN_PATH")
 
     def test_unset_plugin_path_when_all_paths_invalid(self):
         os.environ["HDF5_PLUGIN_PATH"] = "/this/path/does/not/exist"

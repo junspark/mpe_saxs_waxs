@@ -91,7 +91,8 @@ def sanitize_hdf5_plugin_path():
 
     raw_paths = plugin_path.split(os.pathsep)
     valid_paths = [p for p in raw_paths if p and os.path.isdir(p)]
-    if len(valid_paths) == len([p for p in raw_paths if p]):
+    non_empty_count = sum(1 for p in raw_paths if p)
+    if len(valid_paths) == non_empty_count:
         return
 
     if valid_paths:
