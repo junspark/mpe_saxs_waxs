@@ -80,6 +80,35 @@ else:
 # Guards to ensure checks run at most once per process
 _startup_checks_done = False
 
+def sanitize_hdf5_plugin_path():
+    """
+    Remove invalid paths from HDF5_PLUGIN_PATH to avoid h5py read failures.
+    """
+    env_var = "HDF5_PLUGIN_PATH"
+    plugin_path = os.environ.get(env_var)
+    if not plugin_path:
+        return
+
+    raw_paths = plugin_path.split(os.pathsep)
+    valid_paths = [p for p in raw_paths if p and os.path.isdir(p)]
+    if len(valid_paths) == len([p for p in raw_paths if p]):
+        return
+
+    if valid_paths:
+        os.environ[env_var] = os.pathsep.join(valid_paths)
+        print(
+            f"WARNING: Removed invalid entries from {env_var}. "
+            f"Using: {os.environ[env_var]}",
+            file=sys.stderr,
+        )
+    else:
+        os.environ.pop(env_var, None)
+        print(
+            f"WARNING: Unset {env_var} because all configured plugin "
+            f"directories were invalid.",
+            file=sys.stderr,
+        )
+
 def check_build_staleness():
     """
     Compare the newest C source file mtime against the oldest binary mtime.
@@ -187,8 +216,8 @@ def run_startup_checks():
     _startup_checks_done = True
 
     try:
+        sanitize_hdf5_plugin_path()
         check_build_staleness()
         check_update_reminder()
     except Exception:
         pass  # Never let notification checks crash a workflow
-
