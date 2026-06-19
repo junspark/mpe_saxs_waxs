@@ -1196,6 +1196,15 @@ class FFViewer(QtWidgets.QMainWindow):
             "automatically derive and load the equivalent files for the other\n"
             "GE detectors by substituting the detector tag (e.g. ge1→ge2).")
         autoload_row.addWidget(self._autofill_check)
+        self._multi_use_dark_check = QtWidgets.QCheckBox("Subtract dark")
+        self._multi_use_dark_check.setChecked(True)
+        self._multi_use_dark_check.setToolTip(
+            "If unchecked, dark subtraction is skipped entirely in HYDRA\n"
+            "mode (per-detector dark files / dark_loc inside data files are\n"
+            "ignored). Use this when loading already-corrected inputs such\n"
+            "as background-corrected sum files.")
+        self._multi_use_dark_check.toggled.connect(self._load_and_display)
+        autoload_row.addWidget(self._multi_use_dark_check)
         autoload_row.addStretch()
         self._autoload_status = QtWidgets.QLabel("")
         self._autoload_status.setStyleSheet("color: #888888;")
@@ -2099,8 +2108,9 @@ class FFViewer(QtWidgets.QMainWindow):
             v = get_float(src_key)
             if v is not None:
                 cp[dst_key] = v
-        # Auto-detect sibling cake_parameters CSV files next to the param file
-        self._autofind_cake_file(fn)
+        # Cake CSV is no longer auto-loaded from the param-file directory.
+        # The user must explicitly click "Load Cake" to pick a CSV; until then
+        # the cake label stays blank and cake_params_per_det stays empty.
         if hasattr(self, '_cake_edits'):
             self._populate_cake_edits()
 
@@ -3313,9 +3323,11 @@ class FFViewer(QtWidgets.QMainWindow):
         def _worker(emit_progress):
             import time as _time
             t0 = _time.monotonic()
+            sub_dark = bool(self._multi_use_dark_check.isChecked()) \
+                if hasattr(self, '_multi_use_dark_check') else True
             if agg_mode is None or n_accum <= 1:
                 data = _md.composite_frame(states, frame_idx, bds, px,
-                                            op=op, subtract_dark=True,
+                                            op=op, subtract_dark=sub_dark,
                                             parallel=True)
                 return data, _time.monotonic() - t0, 1
 
@@ -3323,7 +3335,7 @@ class FFViewer(QtWidgets.QMainWindow):
             frames_buf = [] if agg_mode == 'median' else None
             for i in range(n_accum):
                 f = _md.composite_frame(states, frame_idx + i, bds, px,
-                                         op=op, subtract_dark=True,
+                                         op=op, subtract_dark=sub_dark,
                                          parallel=True)
                 if agg_mode == 'median':
                     frames_buf.append(f.astype(np.float32, copy=False))
