@@ -4358,10 +4358,13 @@ class RingSelectionDialog(QtWidgets.QDialog):
         lay.addRow("SpaceGroup:", self.sg_edit)
         lay.addRow("Wavelength (Å) or Energy (keV):", self.wl_edit)
         lc_row = QtWidgets.QHBoxLayout()
+        self._lc_container = QtWidgets.QWidget()
+        self._lc_container.setLayout(lc_row)
         for e in self.lc_edits:
             e.setMinimumWidth(70)
             lc_row.addWidget(e)
-        lay.addRow("Lattice Const (Å):", lc_row)
+        lc_row.setContentsMargins(0, 0, 0, 0)
+        lay.addRow("Lattice Const (Å):", self._lc_container)
         lay.addRow("d-spacings (Å):", self.dspacings_edit)
         lay.addRow("Lsd (μm):", self.lsd_edit)
         lay.addRow("MaxRingRad (μm):", self.maxrad_edit)
@@ -4370,6 +4373,19 @@ class RingSelectionDialog(QtWidgets.QDialog):
         btn = QtWidgets.QPushButton("Generate Rings")
         btn.clicked.connect(self._generate_and_select)
         lay.addRow(btn)
+
+        # Disable SpaceGroup + Lattice fields whenever d-spacings is non-empty
+        # so they visibly indicate they're ignored on that branch.
+        self.dspacings_edit.textChanged.connect(self._update_crystal_rows_enabled)
+        self._update_crystal_rows_enabled()
+
+    def _update_crystal_rows_enabled(self):
+        """Gray out SpaceGroup + Lattice Const fields when d-spacings are
+        entered, since those fields are ignored in the d-spacings branch.
+        Re-enable them when the d-spacings field is empty."""
+        has_dspacings = bool(self._parse_dspacings(self.dspacings_edit.text()))
+        self.sg_edit.setEnabled(not has_dspacings)
+        self._lc_container.setEnabled(not has_dspacings)
 
     def _on_material_changed(self, idx):
         """Fill SpaceGroup/Lattice or d-spacings field from the preset."""
