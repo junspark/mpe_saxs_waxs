@@ -1161,8 +1161,18 @@ class FFViewer(QtWidgets.QMainWindow):
             "Cursor R/η are reported in the corrected frame.")
         lay.addWidget(self.tx_edit, 4, 1)
 
+        lay.addWidget(QtWidgets.QLabel("Wavelength (Å)"), 5, 0)
+        self.wl_edit = QtWidgets.QLineEdit(str(self.wl))
+        self.wl_edit.setMinimumWidth(90)
+        self.wl_edit.setToolTip(
+            "X-ray wavelength in Å, or energy in keV (values > 1 are\n"
+            "treated as keV and converted via 12.398 / E).\n"
+            "Used the next time rings are (re)generated from the\n"
+            "Rings Material dialog; existing rings are not auto-recomputed.")
+        lay.addWidget(self.wl_edit, 5, 1)
+
         # See _build_image_display_panel: same trick to keep rows packed at top.
-        lay.setRowStretch(5, 1)
+        lay.setRowStretch(6, 1)
 
         return grp
 
@@ -1392,6 +1402,7 @@ class FFViewer(QtWidgets.QMainWindow):
         self.bcy_edit.editingFinished.connect(self._redraw_if_rings)
         self.bcz_edit.editingFinished.connect(self._redraw_if_rings)
         self.lsd_edit.editingFinished.connect(self._redraw_if_rings)
+        self.wl_edit.editingFinished.connect(self._on_wl_edited)
         self.tx_edit.editingFinished.connect(self._load_and_display)
         self.h5dark_edit.editingFinished.connect(self._load_and_display)
         self.h5dark_edit.editingFinished.connect(lambda: setattr(self, '_h5dark_locked', True))
@@ -1597,6 +1608,7 @@ class FFViewer(QtWidgets.QMainWindow):
         self.mask_fn = state.get('mask_fn', self.mask_fn)
         self.sg = state.get('sg', self.sg)
         self.wl = state.get('wl', self.wl)
+        self._sync_wl_edit()
 
         # ── Widgets that mirror model attributes ─────────────────────
         self.file_nr_edit.setText(str(self.first_file_nr))
@@ -2076,6 +2088,7 @@ class FFViewer(QtWidgets.QMainWindow):
         wl = get_float('Wavelength')
         if wl is not None:
             self.wl = (12.398 / wl) if wl > 1.0 else wl
+            self._sync_wl_edit()
             applied.append(f"Wavelength={self.wl:.5f}Å")
         sg = get_int('SpaceGroup', 'SpaceGroupNumber')
         if sg is not None:
@@ -2895,6 +2908,7 @@ class FFViewer(QtWidgets.QMainWindow):
             self.lsd_edit.setText(str(params['lsd']))
         if params.get('wavelength') is not None:
             self.wl = params['wavelength']
+            self._sync_wl_edit()
         if params.get('space_group') is not None:
             self.sg = params['space_group']
         if params.get('lattice_constant') is not None:
@@ -3110,6 +3124,7 @@ class FFViewer(QtWidgets.QMainWindow):
                 self.px_edit.setText(str(self.pixel_size))
             if 'Wavelength' in p:
                 self.wl = float(p['Wavelength'][0])
+                self._sync_wl_edit()
                 print(f"  Wavelength: {self.wl:.6f} Å")
             if 'SpaceGroup' in p:
                 self.sg = int(p['SpaceGroup'][0])
@@ -3748,6 +3763,31 @@ class FFViewer(QtWidgets.QMainWindow):
             self._draw_caking()
 
     # ── Rings ──────────────────────────────────────────────────────
+
+    def _sync_wl_edit(self):
+        """Push the current self.wl into the Detector & Rings wavelength
+        field. Safe to call before the panel is built (no-op then)."""
+        if hasattr(self, 'wl_edit') and self.wl_edit is not None:
+            self.wl_edit.setText(f"{self.wl:.6f}")
+
+    def _on_wl_edited(self):
+        """Parse the wavelength field on the Detector & Rings panel.
+        Accepts wavelength in Å directly, or energy in keV when the
+        value is > 1 (mirrors RingSelectionDialog convention)."""
+        txt = self.wl_edit.text().strip()
+        if not txt:
+            return
+        try:
+            v = float(txt)
+        except ValueError:
+            return
+        if v <= 0:
+            return
+        wl = (12.398 / v) if v > 1.0 else v
+        self.wl = wl
+        # Reflect the parsed Å value back into the field so the user
+        # can see the keV→Å conversion took effect.
+        self.wl_edit.setText(f"{wl:.6f}")
 
     def _redraw_if_rings(self):
         if self.show_rings and self.ring_rads:
@@ -4415,6 +4455,7 @@ class RingSelectionDialog(QtWidgets.QDialog):
         if wl > 1:
             wl = 12.398 / wl
         self.viewer.wl = wl
+        self.viewer._sync_wl_edit()
         self.viewer.pixel_size = float(self.px_edit.text())
         self.viewer.lsd_local = float(self.lsd_edit.text())
         self.viewer.lsd_orig = self.viewer.lsd_local
