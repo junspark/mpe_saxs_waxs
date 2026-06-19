@@ -1087,29 +1087,55 @@ class FFViewer(QtWidgets.QMainWindow):
         self.transpose_check = QtWidgets.QCheckBox("Transpose")
         lay.addWidget(self.transpose_check, 2, 5)
 
-        # Row 3: aggregation controls — frame count + mutually-exclusive mode
-        # all on one row so their relationship is visually obvious.
-        agg_label = QtWidgets.QLabel("# Frames:")
-        agg_label.setToolTip(
-            "Number of frames to aggregate (Max/Sum/Median), starting at "
-            "Display Frame. May span multiple sibling files.")
-        lay.addWidget(agg_label, 3, 0)
-        self.max_frames_spin = QtWidgets.QSpinBox()
-        self.max_frames_spin.setRange(1, 99999)
-        self.max_frames_spin.setValue(240)
-        self.max_frames_spin.setToolTip(agg_label.toolTip())
-        lay.addWidget(self.max_frames_spin, 3, 1)
+        # Row 3: frame-stack range — pick which frames feed Max/Sum/Median.
+        # Indices are 0-based. Frames actually used = range(Start, End+1, Bin)
+        # so Start=1 Bin=3 End=9 selects frames 1, 4, 7.
+        range_tip = ("Frame range fed to Max/Sum/Median. 0-based.\n"
+                     "Frames used = range(Start, End+1, Bin); e.g. "
+                     "Start=1 Bin=3 End=9 -> frames 1, 4, 7.")
+        self.frame_start_spin = QtWidgets.QSpinBox()
+        self.frame_start_spin.setRange(0, 99999)
+        self.frame_start_spin.setValue(0)
+        self.frame_start_spin.setToolTip(range_tip)
+        self.frame_bin_spin = QtWidgets.QSpinBox()
+        self.frame_bin_spin.setRange(1, 99999)
+        self.frame_bin_spin.setValue(1)
+        self.frame_bin_spin.setToolTip(range_tip)
+        self.frame_end_spin = QtWidgets.QSpinBox()
+        self.frame_end_spin.setRange(0, 99999)
+        self.frame_end_spin.setValue(0)  # snapped to (n_frames_per_file-1) on file load
+        self.frame_end_spin.setToolTip(range_tip)
+        # Nest label/spin pairs in an HBox so labels sit beside (not inside)
+        # the spin boxes; the whole HBox occupies cols 0..5 of the grid row.
+        frames_row = QtWidgets.QHBoxLayout()
+        frames_row.setContentsMargins(0, 0, 0, 0)
+        frames_row.setSpacing(4)
+        for txt, w in (("Frame Start", self.frame_start_spin),
+                       ("Skip", self.frame_bin_spin),
+                       ("End", self.frame_end_spin)):
+            lbl = QtWidgets.QLabel(txt)
+            lbl.setToolTip(range_tip)
+            frames_row.addWidget(lbl)
+            frames_row.addWidget(w)
+            frames_row.addSpacing(8)
+        frames_row.addStretch(1)
+        lay.addLayout(frames_row, 3, 0, 1, 6)
+        # Backwards-compat alias so older code paths still resolve. Reflects
+        # current End value; not used by the new reduction logic.
+        self.max_frames_spin = self.frame_end_spin
+
+        # Row 4: mutually-exclusive aggregation modes.
         self.max_check = QtWidgets.QCheckBox("Max")
-        lay.addWidget(self.max_check, 3, 2)
+        lay.addWidget(self.max_check, 4, 1)
         self.sum_check = QtWidgets.QCheckBox("Sum")
-        lay.addWidget(self.sum_check, 3, 3)
+        lay.addWidget(self.sum_check, 4, 2)
         self.median_check = QtWidgets.QCheckBox("Median")
         self.median_check.setToolTip(
-            "Per-pixel median across # Frames. Loads all frames into memory "
-            "before reducing (slower than Max/Sum on large slabs).")
-        lay.addWidget(self.median_check, 3, 4, 1, 2)
+            "Per-pixel median across selected frames. Loads all selected "
+            "frames into memory before reducing (slower than Max/Sum).")
+        lay.addWidget(self.median_check, 4, 3)
 
-        # Row 4: aggregation progress bar — hidden unless a Max/Sum/Median
+        # Row 5: aggregation progress bar — hidden unless a Max/Sum/Median
         # job is running.
         self.agg_progress = QtWidgets.QProgressBar()
         self.agg_progress.setRange(0, 1)
@@ -1117,12 +1143,12 @@ class FFViewer(QtWidgets.QMainWindow):
         self.agg_progress.setTextVisible(True)
         self.agg_progress.setFormat("")
         self.agg_progress.setVisible(False)
-        lay.addWidget(self.agg_progress, 4, 0, 1, 6)
+        lay.addWidget(self.agg_progress, 5, 0, 1, 6)
 
         # Stretch row: absorbs the extra height the QHBoxLayout gives this
         # panel (it's stretched to match the tallest sibling, Data Source),
         # so the actual rows pack tightly at the top instead of spreading out.
-        lay.setRowStretch(5, 1)
+        lay.setRowStretch(6, 1)
 
         return grp
 
@@ -1505,7 +1531,9 @@ class FFViewer(QtWidgets.QMainWindow):
             'max_intensity': _try_float(self.max_intensity_edit),
             'composite_mode': self.composite_combo.currentText(),
             'detector_mode': self.detector_mode_combo.currentText(),
-            'max_frames_spin': self.max_frames_spin.value(),
+            'frame_start_spin': self.frame_start_spin.value(),
+            'frame_bin_spin': self.frame_bin_spin.value(),
+            'frame_end_spin': self.frame_end_spin.value(),
             'max_per_frames': self.max_check.isChecked(),
             'sum_per_frames': self.sum_check.isChecked(),
             'median_per_frames': self.median_check.isChecked(),
@@ -1634,8 +1662,21 @@ class FFViewer(QtWidgets.QMainWindow):
                                                       self.composite_combo.currentText()))
         self.detector_mode_combo.setCurrentText(state.get('detector_mode',
                                                           self.detector_mode_combo.currentText()))
-        self.max_frames_spin.setValue(int(state.get('max_frames_spin',
-                                                    self.max_frames_spin.value())))
+        # Frame-stack range. Prefer new keys; if only the legacy
+        # 'max_frames_spin' is present, translate it to Start=0 / Bin=1 /
+        # End=N-1 so old presets keep their frame count.
+        if 'frame_start_spin' in state or 'frame_end_spin' in state:
+            self.frame_start_spin.setValue(int(state.get('frame_start_spin',
+                                                         self.frame_start_spin.value())))
+            self.frame_bin_spin.setValue(int(state.get('frame_bin_spin',
+                                                       self.frame_bin_spin.value())))
+            self.frame_end_spin.setValue(int(state.get('frame_end_spin',
+                                                       self.frame_end_spin.value())))
+        elif 'max_frames_spin' in state:
+            legacy_n = max(1, int(state['max_frames_spin']))
+            self.frame_start_spin.setValue(0)
+            self.frame_bin_spin.setValue(1)
+            self.frame_end_spin.setValue(legacy_n - 1)
         self.cmap_combo.setCurrentText(state.get('colormap', 'inferno'))
         self.theme_combo.setCurrentText(state.get('theme', 'light'))
         self.log_check.setChecked(state.get('log', False))
@@ -2178,11 +2219,15 @@ class FFViewer(QtWidgets.QMainWindow):
 
     def _update_frame_max_label(self):
         """Sync the '/ N' indicator next to the Display Frame spin with the
-        currently-known frames-per-file count."""
+        currently-known frames-per-file count, and snap the Frames-End spin
+        to (N-1) so it defaults to "all frames" whenever a new file is loaded.
+        State restore re-applies any saved End value after this runs."""
         if not hasattr(self, 'frame_max_label'):
             return
         n = int(getattr(self, 'n_frames_per_file', 0) or 0)
         self.frame_max_label.setText(f"/ {n}" if n > 0 else "/ —")
+        if n > 0 and hasattr(self, 'frame_end_spin'):
+            self.frame_end_spin.setValue(max(0, n - 1))
 
     def _on_log_toggled(self, checked):
         self.use_log = checked
@@ -3083,7 +3128,9 @@ class FFViewer(QtWidgets.QMainWindow):
             self.ny_edit.setText(str(self.ny)); self.nz_edit.setText(str(self.nz))
             self.nframes_edit.setText(str(self.n_frames_per_file))
             self.frame_spin.setMaximum(self.n_frames_per_file - 1)
-            self.max_frames_spin.setValue(self.n_frames_per_file)
+            self.frame_start_spin.setValue(0)
+            self.frame_bin_spin.setValue(1)
+            # End is snapped to (N-1) inside _update_frame_max_label below.
             self._update_frame_max_label()
         if 'exchange/dark' in zr:
             dk = zr['exchange/dark'][:]
@@ -3284,19 +3331,32 @@ class FFViewer(QtWidgets.QMainWindow):
             agg_mode = 'median'
         elif self.max_check.isChecked():
             agg_mode = 'max'
+        # Multi-det aggregation uses the same Start/Bin/End range as the
+        # single-detector path. Clamp end against the smallest detector's
+        # available frames so we don't ask for indices past the data.
         n_accum = 1
+        agg_indices: list[int] = []
         if agg_mode is not None and nf > 0:
-            n_accum = min(self.max_frames_spin.value(), nf - frame_idx)
-            if n_accum < 1:
-                n_accum = 1
+            f_start = int(self.frame_start_spin.value())
+            f_bin = max(1, int(self.frame_bin_spin.value()))
+            f_end = min(int(self.frame_end_spin.value()), nf - 1)
+            if f_end >= f_start:
+                agg_indices = list(range(f_start, f_end + 1, f_bin))
+            if not agg_indices:
+                agg_indices = [frame_idx]
+            n_accum = len(agg_indices)
 
         if agg_mode is None:
             self.frame_label.setText(
                 f"Frame {frame_idx}  |  multi-det compositing ({len(loaded)})…")
         else:
+            f_start = int(self.frame_start_spin.value())
+            f_bin = max(1, int(self.frame_bin_spin.value()))
+            f_end = int(self.frame_end_spin.value())
             self.frame_label.setText(
                 f"Frame {frame_idx}  |  multi-det {agg_mode.capitalize()} "
-                f"over {n_accum} frames…")
+                f"over {n_accum} frames "
+                f"(Start={f_start} Bin={f_bin} End={f_end})…")
 
         # Set up the progress bar for aggregation jobs (>1 frame). Single
         # frames are fast enough that the bar would just flicker.
@@ -3321,8 +3381,8 @@ class FFViewer(QtWidgets.QMainWindow):
 
             accum = None
             frames_buf = [] if agg_mode == 'median' else None
-            for i in range(n_accum):
-                f = _md.composite_frame(states, frame_idx + i, bds, px,
+            for i, global_idx in enumerate(agg_indices):
+                f = _md.composite_frame(states, global_idx, bds, px,
                                          op=op, subtract_dark=True,
                                          parallel=True)
                 if agg_mode == 'median':
@@ -3377,13 +3437,15 @@ class FFViewer(QtWidgets.QMainWindow):
                 self.setWindowTitle(
                     f"FF Viewer — Multi-Det composite [frame {frame_idx}]")
             else:
+                first_used = agg_indices[0] if agg_indices else frame_idx
+                last_used = agg_indices[-1] if agg_indices else frame_idx
                 self.frame_label.setText(
-                    f"Frames {frame_idx}–{frame_idx + n_used - 1}  |  "
+                    f"Frames {first_used}–{last_used} ({n_used})  |  "
                     f"{agg_mode.capitalize()} composite (op={op}, "
                     f"{len(loaded)} det, {bds}², {1000*elapsed:.0f} ms)")
                 self.setWindowTitle(
                     f"FF Viewer — Multi-Det {agg_mode.capitalize()} "
-                    f"[frames {frame_idx}–{frame_idx + n_used - 1}]")
+                    f"[frames {first_used}–{last_used}]")
             if self.show_rings and self.ring_rads:
                 self._draw_rings()
             if self.show_axes:
@@ -3468,25 +3530,39 @@ class FFViewer(QtWidgets.QMainWindow):
         # Max / Sum / Median aggregation — parallel computation
         if (self.max_check.isChecked() or self.sum_check.isChecked()
                 or self.median_check.isChecked()):
-            n_accum = self.max_frames_spin.value()
+            # Build the explicit frame-index list from Start/Bin/End. End is
+            # inclusive; e.g. Start=1 Bin=3 End=9 -> [1, 4, 7].
+            f_start = int(self.frame_start_spin.value())
+            f_bin = max(1, int(self.frame_bin_spin.value()))
+            f_end = int(self.frame_end_spin.value())
+            if f_end < f_start:
+                self.frame_label.setText(
+                    f"Frame {self.frame_nr}  |  End < Start; nothing to do")
+                return
+            frame_indices = list(range(f_start, f_end + 1, f_bin))
+            n_accum = len(frame_indices)
+            contiguous = (f_bin == 1)
             if self.sum_check.isChecked():
                 mode = 'sum'
             elif self.median_check.isChecked():
                 mode = 'median'
             else:
                 mode = 'max'
-            start_frame = self.frame_nr
+            start_frame = frame_indices[0]
             mode_str = mode.capitalize()
 
             # Disable controls while computing
             self.max_check.setEnabled(False)
             self.sum_check.setEnabled(False)
             self.median_check.setEnabled(False)
-            self.frame_label.setText(f"Computing {mode_str} over {n_accum} frames...")
+            range_desc = (f"{n_accum} frames "
+                          f"(Start={f_start} Bin={f_bin} End={f_end})")
+            self.frame_label.setText(f"Computing {mode_str} over {range_desc}...")
 
             # Capture all parameters for the worker thread
             params = dict(
                 n_accum=n_accum, mode=mode, start_frame=start_frame,
+                frame_indices=frame_indices, contiguous=contiguous,
                 folder=self.folder, file_stem=self.file_stem,
                 first_file_nr=self.first_file_nr, padding=self.padding,
                 det_nr=self.det_nr, ext=self.ext, sep_folder=self.sep_folder,
@@ -3535,11 +3611,17 @@ class FFViewer(QtWidgets.QMainWindow):
                 # very end via apply_image_transforms — no per-path flip
                 # convention to keep in sync.
 
-                # ── Fast path: Zarr slab read ──
+                indices = p['frame_indices']
+                contiguous = p['contiguous']  # True iff f_bin == 1
+
+                # ── Fast path: Zarr slab/fancy read ──
                 if p['zarr_store'] is not None and 'exchange/data' in p['zarr_store']:
                     dset = p['zarr_store']['exchange/data']
-                    end_frame = min(p['start_frame'] + p['n_accum'], dset.shape[0])
-                    slab = dset[p['start_frame']:end_frame, :, :]  # (N, ny, nz)
+                    valid = [i for i in indices if 0 <= i < dset.shape[0]]
+                    if contiguous and valid:
+                        slab = dset[valid[0]:valid[-1] + 1, :, :]
+                    else:
+                        slab = dset[np.asarray(valid, dtype=np.int64), :, :]
                     slab64 = slab.astype(np.float64)
                     if p['mode'] == 'sum':
                         result = np.sum(slab64, axis=0)
@@ -3556,12 +3638,12 @@ class FFViewer(QtWidgets.QMainWindow):
                     result = apply_image_transforms(result,
                         p['do_transpose'], p['hflip'], p['vflip'])
                     elapsed = _time.monotonic() - t0
-                    return result, end_frame - p['start_frame'], elapsed
+                    return result, len(valid), elapsed
 
-                # ── Fast path: single HDF5 file with slab read ──
+                # ── Fast path: single HDF5 file (slab if contiguous, fancy otherwise) ──
                 n_fpf = max(1, p['n_frames_per_file'])
-                first_file = p['first_file_nr'] + p['start_frame'] // n_fpf
-                last_file = p['first_file_nr'] + (p['start_frame'] + p['n_accum'] - 1) // n_fpf
+                first_file = p['first_file_nr'] + indices[0] // n_fpf
+                last_file = p['first_file_nr'] + indices[-1] // n_fpf
                 fn0 = build_filename(p['folder'], p['file_stem'], first_file,
                                      p['padding'], p['det_nr'], p['ext'], p['sep_folder'],
                                      sep=p['file_sep'])
@@ -3573,9 +3655,13 @@ class FFViewer(QtWidgets.QMainWindow):
                             dp = p['hdf5_data_path']
                             if dp in f and f[dp].ndim == 3:
                                 dset = f[dp]
-                                f_start = p['start_frame'] % n_fpf
-                                f_end = min(f_start + p['n_accum'], dset.shape[0])
-                                slab = dset[f_start:f_end, :, :].astype(np.float64)
+                                local_idx = [i % n_fpf for i in indices
+                                             if (i % n_fpf) < dset.shape[0]]
+                                if contiguous and local_idx:
+                                    slab = dset[local_idx[0]:local_idx[-1] + 1, :, :]
+                                else:
+                                    slab = dset[np.asarray(local_idx, dtype=np.int64), :, :]
+                                slab = slab.astype(np.float64)
                                 if p['mode'] == 'sum':
                                     result = np.sum(slab, axis=0)
                                 elif p['mode'] == 'median':
@@ -3589,17 +3675,16 @@ class FFViewer(QtWidgets.QMainWindow):
                                 result = apply_image_transforms(result,
                                     p['do_transpose'], p['hflip'], p['vflip'])
                                 elapsed = _time.monotonic() - t0
-                                return result, f_end - f_start, elapsed
+                                return result, len(local_idx), elapsed
                     except Exception as e:
                         print(f"HDF5 slab read failed, falling back to parallel: {e}")
 
                 # ── General path: ThreadPoolExecutor for raw/TIFF/multi-file ──
                 # Each worker returns a RAW frame; dark subtraction and the
                 # final user transform happen once after accumulation below.
-                def _read_one(frame_idx):
-                    fr = p['start_frame'] + frame_idx
-                    f_nr = p['first_file_nr'] + fr // n_fpf
-                    f_in = fr % n_fpf
+                def _read_one(global_frame_idx):
+                    f_nr = p['first_file_nr'] + global_frame_idx // n_fpf
+                    f_in = global_frame_idx % n_fpf
                     fn = build_filename(p['folder'], p['file_stem'], f_nr,
                                         p['padding'], p['det_nr'], p['ext'],
                                         p['sep_folder'], sep=p['file_sep'])
@@ -3619,7 +3704,7 @@ class FFViewer(QtWidgets.QMainWindow):
                     [] if p['mode'] == 'median' else None)
                 count = 0
                 with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    futures = {pool.submit(_read_one, i): i for i in range(p['n_accum'])}
+                    futures = {pool.submit(_read_one, gi): gi for gi in indices}
                     for future in concurrent.futures.as_completed(futures):
                         try:
                             frame = future.result()
