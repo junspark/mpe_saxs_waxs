@@ -1074,11 +1074,12 @@ class FFViewer(QtWidgets.QMainWindow):
         self.bpp_edit.setFixedWidth(35)
         lay.addWidget(self.bpp_edit, 1, 3)
 
-        # Row 2: pixel size + transforms
-        lay.addWidget(QtWidgets.QLabel("Pixel Size (μm)"), 2, 0, 1, 2)
+        # Row 2: pixel size + transforms. Label in col 0, entry in col 1 so
+        # the value column aligns with the Pixels H / Header entries above.
+        lay.addWidget(QtWidgets.QLabel("Pixel Size (μm)"), 2, 0)
         self.px_edit = QtWidgets.QLineEdit(str(self.pixel_size))
-        self.px_edit.setFixedWidth(55)
-        lay.addWidget(self.px_edit, 2, 2)
+        self.px_edit.setFixedWidth(80)
+        lay.addWidget(self.px_edit, 2, 1, 1, 2)
 
         self.hflip_check = QtWidgets.QCheckBox("HFlip")
         lay.addWidget(self.hflip_check, 2, 3)
