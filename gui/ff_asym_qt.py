@@ -489,6 +489,16 @@ def compute_ring_points(ring_rad, lsd_local, lsd_orig, bc, px,
 class FFViewer(QtWidgets.QMainWindow):
     """FF-HEDM image viewer with reactive controls and ring overlays."""
 
+    # Default font size for the viewer UI. Overridden by QSettings if the user
+    # has previously changed it via combo/spin/shortcut. Bumped from the Qt
+    # default (~9pt) to something comfortably readable on a modern laptop.
+    DEFAULT_FONT_SIZE = 11
+    FONT_MIN = 8
+    FONT_MAX = 36
+    # QSettings key namespace — org/app name pair that keys user preferences.
+    _QSETTINGS_ORG = "MIDAS"
+    _QSETTINGS_APP = "FFViewer"
+
     def __init__(self, theme='light', auto_detect=True):
         super().__init__()
         self.setWindowTitle("FF Viewer (PyQtGraph) — MIDAS")
@@ -833,8 +843,10 @@ class FFViewer(QtWidgets.QMainWindow):
         view_menu.addAction(self.log_panel.toggleViewAction())
         view_menu.addAction(self._ivf_dock.toggleViewAction())
 
-        # Apply initial font so the viewer opens at a readable size.
-        self._on_font_changed(self.font_spin.value())
+        # Apply initial font so the viewer opens at a readable size. Prefer
+        # the QSettings-persisted value over the spinbox default (14pt) so
+        # subsequent launches respect the user's last chosen size.
+        self._on_font_changed(self._read_font_setting())
 
     def _build_toolbar(self):
         tb = QtWidgets.QHBoxLayout()
@@ -942,9 +954,16 @@ class FFViewer(QtWidgets.QMainWindow):
 
         tb.addWidget(QtWidgets.QLabel("Font:"))
         self.font_size_combo = QtWidgets.QComboBox()
-        self.font_size_combo.addItems(["8", "9", "10", "11", "12", "14"])
-        app = QtWidgets.QApplication.instance()
-        self.font_size_combo.setCurrentText(str(app.font().pointSize()))
+        # 16/18 added for the "give me BIG text" case. Editable so shortcuts
+        # (Ctrl+= / Ctrl+-) or manual typing can produce any value in the
+        # spinbox range without needing to hit a preset. _on_font_size_changed
+        # already tolerates unparseable text (returns early).
+        self.font_size_combo.setEditable(True)
+        self.font_size_combo.addItems(["8", "9", "10", "11", "12", "14", "16", "18"])
+        # Initial value: prefer persisted QSettings, else DEFAULT_FONT_SIZE.
+        # Ignore Qt's app default (~9pt) — it's too small for modern laptops.
+        initial_font = self._read_font_setting()
+        self.font_size_combo.setCurrentText(str(initial_font))
         self.font_size_combo.setFixedWidth(50)
         self.font_size_combo.currentTextChanged.connect(self._on_font_size_changed)
         tb.addWidget(self.font_size_combo)
@@ -1829,6 +1848,13 @@ class FFViewer(QtWidgets.QMainWindow):
         add_shortcut(self, 'A', lambda: self.axes_check.toggle())
         add_shortcut(self, 'C', self._toggle_cake_overlay)
         add_shortcut(self, 'Q', self.close)
+        # VS-Code-style font zoom. Ctrl+= and Ctrl++ both bumped because
+        # different keyboard layouts / locales generate one or the other for
+        # the same physical keypress. Ctrl+0 resets to DEFAULT_FONT_SIZE.
+        add_shortcut(self, 'Ctrl+=', lambda: self._font_step(+1))
+        add_shortcut(self, 'Ctrl++', lambda: self._font_step(+1))
+        add_shortcut(self, 'Ctrl+-', lambda: self._font_step(-1))
+        add_shortcut(self, 'Ctrl+0', lambda: self._on_font_changed(self.DEFAULT_FONT_SIZE))
 
     # ── Session Save / Load ────────────────────────────────────────
 
@@ -2652,7 +2678,49 @@ class FFViewer(QtWidgets.QMainWindow):
         self._theme = theme
         apply_theme(QtWidgets.QApplication.instance(), theme)
 
+    def _read_font_setting(self):
+        """Return the persisted font size, clamped to [FONT_MIN, FONT_MAX],
+        falling back to DEFAULT_FONT_SIZE when no setting exists (or when
+        the stored value is unparseable — e.g. corrupted QSettings)."""
+        settings = QtCore.QSettings(self._QSETTINGS_ORG, self._QSETTINGS_APP)
+        try:
+            size = int(settings.value("font_size", self.DEFAULT_FONT_SIZE))
+        except (TypeError, ValueError):
+            size = self.DEFAULT_FONT_SIZE
+        return max(self.FONT_MIN, min(self.FONT_MAX, size))
+
+    def _sync_font_widgets(self, size):
+        """Push ``size`` into both font widgets without re-firing handlers,
+        so combo, spinbox and applied font all agree after a shortcut zoom."""
+        combo = getattr(self, 'font_size_combo', None)
+        if combo is not None:
+            combo.blockSignals(True)
+            combo.setCurrentText(str(size))
+            combo.blockSignals(False)
+        spin = getattr(self, 'font_spin', None)
+        if spin is not None:
+            spin.blockSignals(True)
+            spin.setValue(size)
+            spin.blockSignals(False)
+
+    def _font_step(self, delta):
+        """Bump font by ``delta`` pt, clamped. Fires the full _on_font_changed
+        path so stylesheet + pg axes update and QSettings persists."""
+        cur = self._read_font_setting()
+        # Prefer the live combo value if present — the setting is only a
+        # fallback, and the user may have just picked a different size.
+        combo = getattr(self, 'font_size_combo', None)
+        if combo is not None:
+            try:
+                cur = int(combo.currentText())
+            except (ValueError, TypeError):
+                pass
+        new_size = max(self.FONT_MIN, min(self.FONT_MAX, cur + delta))
+        if new_size != cur:
+            self._on_font_changed(new_size)
+
     def _on_font_changed(self, size):
+        size = max(self.FONT_MIN, min(self.FONT_MAX, int(size)))
         QtWidgets.QApplication.instance().setStyleSheet(f'* {{ font-size: {size}pt; }}')
         # pyqtgraph axes ignore Qt stylesheets — update tick fonts explicitly.
         font = QtGui.QFont('', int(size))
@@ -2682,6 +2750,13 @@ class FFViewer(QtWidgets.QMainWindow):
         # pyqtgraph TextItems also don't pick up the stylesheet — redraw axes.
         if self.show_axes:
             self._draw_axes()
+        # Sync the two font widgets (combo + spin) so both display the applied
+        # size after a shortcut zoom or a programmatic apply. blockSignals()
+        # inside _sync_font_widgets prevents re-firing this handler.
+        self._sync_font_widgets(size)
+        # Persist so next session opens at the same size.
+        settings = QtCore.QSettings(self._QSETTINGS_ORG, self._QSETTINGS_APP)
+        settings.setValue("font_size", size)
 
     def _on_frame_scroll(self, delta):
         self.frame_spin.setValue(self.frame_spin.value() + delta)
