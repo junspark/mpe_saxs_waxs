@@ -562,6 +562,10 @@ class FFViewer(QtWidgets.QMainWindow):
         self.ring_nrs = []
         self.hkls = []
         self.rings_to_show = []
+        # Set when rings came from the d-spacings branch of the material
+        # dialog (AgBe et al.); empty for the crystallographic path.
+        # Consumed by _build_calibration_ps_txt to bypass GetHKLList.
+        self.dspacings = []
         self.show_rings = False
         self._ring_items = []
 
@@ -4571,10 +4575,19 @@ class FFViewer(QtWidgets.QMainWindow):
         lines.append(f'p2 {_f(self.p2_edit)}')
         lines.append(f'p3 {_f(self.p3_edit)}')
 
-        # Rings + crystallography.
-        lines.append(f'SpaceGroup {self.sg}')
-        lc = ' '.join(f'{v}' for v in self.lattice_const)
-        lines.append(f'LatticeConstant {lc}')
+        # Rings + crystallography. When the ring set came from the
+        # d-spacings branch (AgBe et al.), emit DSpacing lines and
+        # OMIT SpaceGroup/LatticeConstant: CalibrantIntegratorOMP sees
+        # nDSpacings > 0 and bypasses GetHKLList, deriving Theta per
+        # ring from Bragg's law directly. The crystallographic path
+        # (CeO2, LaB6, …) keeps the SpaceGroup/LatticeConstant route.
+        if self.dspacings:
+            for d in self.dspacings:
+                lines.append(f'DSpacing {d}')
+        else:
+            lines.append(f'SpaceGroup {self.sg}')
+            lc = ' '.join(f'{v}' for v in self.lattice_const)
+            lines.append(f'LatticeConstant {lc}')
         rhod = getattr(self, 'temp_max_ring_rad', 0) or max(self.ring_rads)
         lines.append(f'RhoD {rhod}')
         lines.append(f'MaxRingRad {rhod}')
@@ -5674,6 +5687,12 @@ class FFViewer(QtWidgets.QMainWindow):
             self.ring_nrs = dlg.ring_nrs
             self.hkls = dlg.hkls
             self.rings_to_show = dlg.rings_to_show
+            # d-spacings are only present when the ring set came from the
+            # d-spacings branch of the material dialog (AgBe et al.).
+            # Empty list for the crystallographic (SpaceGroup+Lattice) path
+            # — _build_calibration_ps_txt uses this to decide whether to
+            # emit DSpacing lines or SpaceGroup/LatticeConstant.
+            self.dspacings = list(getattr(dlg, 'dspacings', []) or [])
             # Cache d-spacings + reference (wl, Lsd) so Energy edits on
             # the main panel can rescale ring radii without re-running
             # GetHKLList. See _recompute_ring_rads_for_wl.
@@ -5963,6 +5982,7 @@ class RingSelectionDialog(QtWidgets.QDialog):
                 'nr': n,
                 'hkl': [0, 0, n],
                 'rad': r,
+                'd': d,   # marker: rings from Bragg / d-spacings, not GetHKLList
                 'display': f"d={d:.4f}Å  2θ={math.degrees(two_theta):.4f}°  r={r:.2f}μm",
             })
         for n, d, why in skipped:
@@ -6001,6 +6021,11 @@ class RingSelectionDialog(QtWidgets.QDialog):
         self.ring_rads = [all_rings[i.row()]['rad'] for i in sel]
         self.ring_nrs = [all_rings[i.row()]['nr'] for i in sel]
         self.hkls = [all_rings[i.row()]['hkl'] for i in sel]
+        # Only set when rings came from the d-spacings branch (each ring has
+        # a 'd' key). The caller uses this to route the calibration path
+        # around GetHKLList / SpaceGroup for lamellar SAXS calibrants.
+        self.dspacings = [all_rings[i.row()]['d']
+                          for i in sel if 'd' in all_rings[i.row()]]
         self.rings_to_show = self.ring_nrs[:]
         self.accept()
 
