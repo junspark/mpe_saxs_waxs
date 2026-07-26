@@ -710,12 +710,13 @@ class FFViewer(QtWidgets.QMainWindow):
         self.image_view.fontSizeChanged.connect(self._on_font_changed)
         self.image_view.levelsChanged.connect(self._on_hist_levels_dragged)
 
-        # ── Control Panels (built first so they can go in the splitter) ──
+        # ── Control Panels ──
+        # Built here first so they can go inside the detachable Controls
+        # dock (below). Stack the single/multi-detector Data Source panels;
+        # the toolbar Multi-Det checkbox swaps which one is visible.
         ctrl = QtWidgets.QHBoxLayout()
         ctrl.setContentsMargins(0, 0, 0, 0)
         ctrl.setSpacing(4)
-        # Stack the single-detector and multi-detector data-source panels;
-        # the toolbar Multi-Det checkbox swaps which one is visible.
         self._file_stack = QtWidgets.QStackedWidget()
         self._file_stack.addWidget(self._build_file_panel())     # 0: single
         self._file_stack.addWidget(self._build_multi_panel())    # 1: multi
@@ -725,67 +726,50 @@ class FFViewer(QtWidgets.QMainWindow):
         ctrl_widget = QtWidgets.QWidget()
         ctrl_widget.setLayout(ctrl)
 
-        # Wrap the controls in a scroll area so:
-        #   - the bottom's *effective* minimum stays small (~one row),
-        #     letting the user shrink the window without hitting a tall
-        #     floor from the multi-detector panel's full content height,
-        #   - swapping the QStackedWidget page (single ↔ multi) or growing
-        #     content (cake editor, status labels) scrolls inside the
-        #     viewport instead of stealing height from the image area.
+        # Wrap the controls in a scroll area so the effective minimum stays
+        # small (~one row). Users can shrink the dock without hitting the
+        # multi-detector panel's full-height floor; scrollbar takes over
+        # when content exceeds visible area. Horizontal scroll enabled too
+        # (used to be AlwaysOff for the splitter layout) so the panel keeps
+        # its horizontal footprint when floated to a narrow window rather
+        # than truncating right-side sections.
         ctrl_scroll = QtWidgets.QScrollArea()
         ctrl_scroll.setWidget(ctrl_widget)
         ctrl_scroll.setWidgetResizable(True)
         ctrl_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        ctrl_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        ctrl_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         ctrl_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        # Let the user drag the splitter down to a small slice; the scroll
-        # area's vertical scrollbar takes over once the inner widget can't
-        # fit. Without this the splitter clamps to the controls' natural
-        # minimumSizeHint and the divider feels stuck.
         ctrl_scroll.setMinimumHeight(80)
 
-        # Vertical splitter so the image dominates at startup but the user
-        # can drag the divider for more controls space. Stretch factors
-        # 1:0 send any extra vertical space to the image, never the
-        # bottom. Initial bottom size is the controls' sizeHint capped at
-        # BOTTOM_INIT_CAP so the image gets a generous starting share even
-        # when the controls' natural height is large (multi-det panel,
-        # tall fonts); the user can drag the divider either way.
-        # Cap the initial controls-pane height at ~1/3 of the current
-        # window (proportional so laptop screens don't lose the image
-        # to a tall controls block); floor at 200 px so multi-detector
-        # rows aren't hidden on the first click.
+        # Image now goes directly into main_layout. Controls live in a
+        # detachable QDockWidget (BottomDockWidgetArea by default) so users
+        # on laptop screens — where the fixed horizontal bottom strip was
+        # chopped and required horizontal scrolling — can drag it off to
+        # float as a free window, dock it at another edge, hide it, or
+        # resize by grabbing the dock's top edge. Toggle via View menu.
+        main_layout.addWidget(self.image_view, stretch=1)
+
+        self._controls_dock = QtWidgets.QDockWidget("Controls", self)
+        self._controls_dock.setObjectName("ff_controls_dock")
+        self._controls_dock.setWidget(ctrl_scroll)
+        self._controls_dock.setFeatures(
+            QtWidgets.QDockWidget.DockWidgetMovable |
+            QtWidgets.QDockWidget.DockWidgetFloatable |
+            QtWidgets.QDockWidget.DockWidgetClosable)
+        self._controls_dock.setAllowedAreas(QtCore.Qt.AllDockWidgetAreas)
+        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self._controls_dock)
+
+        # Cap the initial dock height at ~1/3 of the window (proportional
+        # so laptop screens don't lose the image to a tall controls block);
+        # floor at 200 px so multi-detector rows aren't hidden on first
+        # launch. Mirrors the pre-refactor BOTTOM_INIT_CAP splitter logic.
         BOTTOM_INIT_CAP = max(200, int(self.height() * 0.34))
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        splitter.addWidget(self.image_view)
-        splitter.addWidget(ctrl_scroll)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
         ctrl_widget.adjustSize()
         sb_w = self.style().pixelMetric(QtWidgets.QStyle.PM_ScrollBarExtent)
-        bottom_h = min(ctrl_widget.sizeHint().height() + sb_w + 4,
-                       BOTTOM_INIT_CAP)
-        # Send the rest to the image pane, not a hardcoded 900 that would
-        # exceed short-screen heights and force the splitter to clip.
-        top_h = max(200, self.height() - bottom_h)
-        splitter.setSizes([top_h, bottom_h])
-        splitter.setChildrenCollapsible(False)
-        # Make the divider visibly grabbable (default 1-px handle is
-        # invisible on most themes so users don't realize they can drag
-        # it). 8-px handle with a subtle hover tint = obvious affordance
-        # without dominating the layout.
-        splitter.setHandleWidth(8)
-        splitter.setStyleSheet(
-            "QSplitter::handle:vertical {"
-            " background: palette(mid); "
-            " border-top: 1px solid palette(dark);"
-            " border-bottom: 1px solid palette(dark);"
-            "}"
-            "QSplitter::handle:vertical:hover {"
-            " background: palette(highlight);"
-            "}")
-        main_layout.addWidget(splitter, stretch=1)
-        self._main_splitter = splitter
+        initial_h = min(ctrl_widget.sizeHint().height() + sb_w + 4,
+                        BOTTOM_INIT_CAP)
+        self.resizeDocks([self._controls_dock], [initial_h],
+                         QtCore.Qt.Vertical)
 
         # ── Status Bar ──
         self.status_label = QtWidgets.QLabel("Ready")
@@ -840,6 +824,12 @@ class FFViewer(QtWidgets.QMainWindow):
 
         # View menu to toggle docks
         view_menu = self.menuBar().addMenu('&View')
+        # Controls dock listed first — it's the primary panel and users may
+        # need to bring it back after accidentally closing.
+        ctrl_toggle = self._controls_dock.toggleViewAction()
+        ctrl_toggle.setText('Controls Panel')
+        ctrl_toggle.setShortcut('Ctrl+/')
+        view_menu.addAction(ctrl_toggle)
         view_menu.addAction(self.log_panel.toggleViewAction())
         view_menu.addAction(self._ivf_dock.toggleViewAction())
 
