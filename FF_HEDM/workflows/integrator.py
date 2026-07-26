@@ -708,7 +708,8 @@ class FileProcessor:
                     # frame data we don't re-emit, analysis params are rewritten by
                     # this run, processed/* is written by the bright/flat pipeline,
                     # and measurement/process/scan_parameters is handled above with
-                    # its datatype/start/step carve-out.
+                    # its datatype/start/step carve-out. Supersedes the earlier
+                    # hardcoded ('instrument','misc','Detector','StorageRing') list.
                     _INTEGRATOR_OWNED = {'exchange', 'analysis', 'processed', 'measurement'}
                     for src_name in z_in.keys():
                         if src_name in _INTEGRATOR_OWNED:

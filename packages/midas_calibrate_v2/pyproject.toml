@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "midas-calibrate-v2"
-version = "0.3.3"
+version = "0.5.2"
 description = "Fully differentiable detector calibration for MIDAS — multi-image, Bayesian, NN-residual, joint forward cake. Coexists with midas-calibrate v1."
 readme = "README.md"
 license = { text = "BSD-3-Clause" }
@@ -40,6 +40,7 @@ all = ["pyro-ppl>=1.8", "matplotlib>=3.5", "pytest>=7", "pandas>=1.5"]
 
 [project.scripts]
 midas-calibrate-v2 = "midas_calibrate_v2.cli:main"
+midas-calibrate-v2-pick = "midas_calibrate_v2.gui.ringpicker:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

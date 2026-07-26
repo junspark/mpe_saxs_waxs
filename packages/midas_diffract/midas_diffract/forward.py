@@ -27,12 +27,23 @@ Reference C code:
 """
 
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Canonical orientation + strain-frame primitives. midas_stress is the single
+# source of truth for this math (Bunge ZXZ orientation algebra, sample<->crystal
+# strain rotation); its torch backend is differentiable end-to-end and
+# device-portable, so the forward model delegates rather than re-porting.
+# NOTE: midas_stress's Voigt is Voigt-MANDEL (sqrt2 on shears); this model uses
+# PLAIN-Voigt / raw 3x3 strain, so we only delegate the *rotation*, never the
+# Voigt packing (see rotate_strain_sample_to_crystal / correct_hkls_latc).
+from midas_stress.orientation import euler_to_orient_mat as _ms_euler_to_orient_mat
+from midas_stress.tensor import strain_lab_to_grain as _ms_strain_lab_to_grain
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +100,16 @@ class HEDMGeometry:
                                    # Default False preserves the existing
                                    # behaviour: NF applies tilts, FF skips.
                                    # Set True for raw multi-panel simulation.
+    # Radial detector distortion (canonical midas_distortion v2 model). Like
+    # tilts, this maps an IDEAL prediction to the RAW detector position and is
+    # OFF by default -- the FF/pf experimental pipeline pre-corrects distortion
+    # at peak-finding time (transforms), so the forward must NOT re-apply it for
+    # the indexer/fit-grain. Raw-pixel-patch consumers (pf_odf, grain_odf) that
+    # never go through transforms set ``apply_distortion=True`` and supply the
+    # calibrated v2 coefficients to predict in the raw frame.
+    apply_distortion: bool = False
+    p_distortion: "list[float] | None" = None   # 15 v2 coeffs (midas_distortion P_COEF_NAMES order); None/zeros => no-op
+    rho_d: "float | None" = None                # distortion radius normalization (um); None => resolve from detector corner
     multi_mode: str = "layered"    # "layered" (default): NF semantics --
                                    # spot must land on the detector at
                                    # EVERY distance (AllDistsFound).
@@ -342,6 +363,25 @@ class HEDMForwardModel(nn.Module):
 
         # Multi-detector / multi-panel configuration
         self.apply_tilts = bool(geometry.apply_tilts)
+
+        # Radial detector distortion (canonical midas_distortion v2 model),
+        # applied ideal->raw in project_to_detector when apply_distortion=True.
+        # OFF by default => identity => indexer/fit-grain output unchanged.
+        self.apply_distortion = bool(getattr(geometry, "apply_distortion", False))
+        p_dist = getattr(geometry, "p_distortion", None)
+        if p_dist is not None:
+            self.p_distortion = nn.Parameter(
+                torch.as_tensor(p_dist, dtype=torch.float64, device=device),
+                requires_grad=False,
+            )
+            self._has_distortion = bool(
+                torch.any(torch.abs(self.p_distortion.detach()) > 0.0).item()
+            )
+        else:
+            self.p_distortion = None
+            self._has_distortion = False
+        self.rho_d = getattr(geometry, "rho_d", None)
+
         if geometry.multi_mode not in ("layered", "panel"):
             raise ValueError(
                 f"Unknown multi_mode {geometry.multi_mode!r}; "
@@ -408,7 +448,13 @@ class HEDMForwardModel(nn.Module):
 
     @staticmethod
     def euler2mat(euler_angles: torch.Tensor) -> torch.Tensor:
-        """Convert ZXZ Euler angles to rotation matrices.
+        """Convert ZXZ (Bunge) Euler angles to crystal->sample rotation matrices.
+
+        Delegates to ``midas_stress.orientation.euler_to_orient_mat`` -- the
+        canonical orientation primitive -- so the convention can never drift
+        from the rest of MIDAS. midas_stress's torch backend is differentiable
+        and vmap-safe; the result is identical to the former in-line ZXZ build
+        (R = Rz(phi1) @ Rx(Phi) @ Rz(phi2)) to ~1e-16.
 
         Parameters
         ----------
@@ -418,35 +464,14 @@ class HEDMForwardModel(nn.Module):
         Returns
         -------
         Tensor (..., 3, 3)
-            Rotation matrices.
+            Rotation matrices (crystal->sample), orthogonalized onto SO(3).
         """
-        c = torch.cos(euler_angles)
-        s = torch.sin(euler_angles)
-
-        c0, c1, c2 = c[..., 0], c[..., 1], c[..., 2]
-        s0, s1, s2 = s[..., 0], s[..., 1], s[..., 2]
-
-        # ZXZ rotation matrix: R = Rz(phi1) @ Rx(Phi) @ Rz(phi2)
-        # Verified element-by-element against nfhedm.py lines 114-120.
-        # Built via torch.stack rather than indexed assignment so the function
-        # composes with torch.func.vmap (in-place writes block vmap).
-        row0 = torch.stack([
-             c0 * c2 - s0 * c1 * s2,
-            -s0 * c1 * c2 - c0 * s2,
-             s0 * s1,
-        ], dim=-1)
-        row1 = torch.stack([
-             s0 * c2 + c0 * c1 * s2,
-             c0 * c1 * c2 - s0 * s2,
-            -c0 * s1,
-        ], dim=-1)
-        row2 = torch.stack([
-            s1 * s2,
-            s1 * c2,
-            c1,
-        ], dim=-1)
-        R = torch.stack([row0, row1, row2], dim=-2)
-
+        if not isinstance(euler_angles, torch.Tensor):
+            euler_angles = torch.as_tensor(euler_angles)
+        R = _ms_euler_to_orient_mat(euler_angles)          # (..., 9), torch
+        R = R.reshape(*R.shape[:-1], 3, 3)
+        # midas_stress already returns a proper rotation; orthogonalize keeps the
+        # historical "exactly on SO(3)" guarantee and is idempotent here.
         return HEDMForwardModel.orthogonalize(R)
 
     # ------------------------------------------------------------------
@@ -497,6 +522,28 @@ class HEDMForwardModel(nn.Module):
         return torch.acos(torch.clamp(x, -1.0 + self.epsilon, 1.0 - self.epsilon))
 
     # ------------------------------------------------------------------
+    #  strain_as_voigt  (accept full 3x3 tensor OR plain-Voigt 6-vector)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def strain_as_voigt(strain: torch.Tensor) -> torch.Tensor:
+        """Normalize a strain input to PLAIN-Voigt [e11,e12,e13,e22,e23,e33].
+
+        Accepts either a plain-Voigt ``(..., 6)`` tensor (returned unchanged) or
+        a full symmetric ``(..., 3, 3)`` strain tensor. The 3x3 path is
+        convention-free -- the natural way to hand a strain field straight from
+        a tensor source (e.g. a midas_stress strain field) into the forward
+        model without picking a Voigt/Mandel packing. The off-diagonals are
+        taken as TRUE tensor components (no factor of 2).
+        """
+        if strain.dim() >= 2 and strain.shape[-1] == 3 and strain.shape[-2] == 3:
+            return torch.stack([
+                strain[..., 0, 0], strain[..., 0, 1], strain[..., 0, 2],
+                strain[..., 1, 1], strain[..., 1, 2], strain[..., 2, 2],
+            ], dim=-1)
+        return strain
+
+    # ------------------------------------------------------------------
     #  rotate_strain_sample_to_crystal  (port of C RotateStrainSampleToCrystal)
     # ------------------------------------------------------------------
 
@@ -507,19 +554,27 @@ class HEDMForwardModel(nn.Module):
     ) -> torch.Tensor:
         """Rotate a symmetric infinitesimal strain from sample to crystal frame.
 
-        Port of ``RotateStrainSampleToCrystal`` from
+        Matches ``RotateStrainSampleToCrystal`` from
         ``FF_HEDM/src/ForwardSimulationCompressed.c:399-419``:
-        eps_crystal = OM^T . eps_sample . OM, in Voigt notation
-        [eps_11, eps_12, eps_13, eps_22, eps_23, eps_33].
+        eps_crystal = OM^T . eps_sample . OM.
+
+        The rotation is delegated to ``midas_stress.tensor.strain_lab_to_grain``
+        (the canonical sample/lab -> crystal/grain strain transform; bit-identical
+        to the former in-line ``OM^T S OM``). PLAIN-Voigt pack/unpack is kept here
+        on purpose -- midas_stress's Voigt is Mandel (sqrt2 on shears), which must
+        not touch the forward model's strain input.
 
         Parameters
         ----------
         orientation_matrices : Tensor (..., 3, 3)
+            Crystal->sample matrices (as returned by :meth:`euler2mat`).
         strain_sample : Tensor (..., 6)
+            PLAIN-Voigt [eps_11, eps_12, eps_13, eps_22, eps_23, eps_33].
 
         Returns
         -------
         strain_crystal : Tensor (..., 6)
+            PLAIN-Voigt, same layout.
         """
         e = strain_sample
         S = torch.stack([
@@ -527,8 +582,7 @@ class HEDMForwardModel(nn.Module):
             torch.stack([e[..., 1], e[..., 3], e[..., 4]], dim=-1),
             torch.stack([e[..., 2], e[..., 4], e[..., 5]], dim=-1),
         ], dim=-2)
-        OM = orientation_matrices
-        C = torch.matmul(torch.matmul(OM.transpose(-1, -2), S), OM)
+        C = _ms_strain_lab_to_grain(S, orientation_matrices)   # OM^T S OM
         return torch.stack([
             C[..., 0, 0], C[..., 0, 1], C[..., 0, 2],
             C[..., 1, 1], C[..., 1, 2], C[..., 2, 2],
@@ -558,10 +612,12 @@ class HEDMForwardModel(nn.Module):
         lattice_params : Tensor (..., 6)
             [a, b, c, alpha, beta, gamma] in Angstroms and degrees.
             The ``...`` dimensions allow per-voxel or per-grain parameters.
-        strain : Tensor (..., 6), optional
-            Crystal-frame symmetric infinitesimal strain in Voigt form
-            [eps_11, eps_12, eps_13, eps_22, eps_23, eps_33]. When supplied,
-            the reciprocal lattice is post-multiplied by (I + eps)^{-1}:
+        strain : Tensor (..., 6) or (..., 3, 3), optional
+            Crystal-frame symmetric infinitesimal strain, either PLAIN-Voigt
+            [eps_11, eps_12, eps_13, eps_22, eps_23, eps_33] or a full symmetric
+            3x3 tensor (normalized via :meth:`strain_as_voigt`; off-diagonals are
+            true tensor components, no factor of 2). When supplied, the
+            reciprocal lattice is post-multiplied by (I + eps)^{-1}:
             B = (I + eps)^{-1} @ B0. Use :meth:`rotate_strain_sample_to_crystal`
             to convert a sample-frame strain into the crystal frame.
 
@@ -642,6 +698,7 @@ class HEDMForwardModel(nn.Module):
         # Voigt layout matches C CorrectHKLsLatCEpsilon:
         #   eps = [eps_11, eps_12, eps_13, eps_22, eps_23, eps_33]
         if strain is not None:
+            strain = self.strain_as_voigt(strain)   # accept full 3x3 too
             e11 = strain[..., 0]
             e12 = strain[..., 1]
             e13 = strain[..., 2]
@@ -682,6 +739,7 @@ class HEDMForwardModel(nn.Module):
         orientation_matrices: torch.Tensor,
         hkls_cart: Optional[torch.Tensor] = None,
         thetas: Optional[torch.Tensor] = None,
+        per_grain: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Core Bragg geometry: orientations + G-vectors -> angles.
 
@@ -723,14 +781,32 @@ class HEDMForwardModel(nn.Module):
         # batch, (b) per-voxel hkls_cart shape (..., M, 3) for strained
         # rendering. Both flow through the same einsum via leading-dim
         # broadcasting on the second arg.
-        G_C = torch.einsum("...nij,...mj->...nmi", orientation_matrices, hkls_cart)
+        #
+        # per_grain=True: ELEMENT-WISE pairing of grain i's orientation with
+        # grain i's strained hkls -- NO orientation x strain cross-product.
+        # Requires orientation_matrices (N,3,3); hkls_cart (N,M,3) per-grain or
+        # (M,3) shared. Used by forward_per_grain() for the O(N*M) fast path.
+        if per_grain:
+            if hkls_cart.dim() == 2:                 # (M,3) shared lattice
+                G_C = torch.einsum("nij,mj->nmi", orientation_matrices, hkls_cart)
+            else:                                    # (N,M,3) per-grain strain
+                G_C = torch.einsum("nij,nmj->nmi", orientation_matrices, hkls_cart)
+        else:
+            G_C = torch.einsum("...nij,...mj->...nmi", orientation_matrices, hkls_cart)
 
         # v = sin(theta)*|G| -- C precomputes Gs from the UNROTATED G-vector norm
         # (rotation preserves norm in exact arithmetic but not in float64).
         # Match C: use |hkls_cart| (pre-rotation), not |R @ hkls_cart|.
         len_hkl = torch.norm(hkls_cart, dim=-1)  # (M,) or (..., M)
         v_no_wedge = torch.sin(thetas) * len_hkl  # (M,) or (..., M)
-        v_no_wedge = v_no_wedge.unsqueeze(-2).expand_as(G_C[..., 0])  # (..., N, M)
+        # Broadcast v to G_C's (..., N, M) grid. Layout-agnostic: in the
+        # cross-product layout v gains an orientation axis at -2; in the
+        # per_grain / shared layouts it already matches. Numerically identical
+        # to the former ``unsqueeze(-2).expand_as`` for those existing paths.
+        gc0 = G_C[..., 0]
+        while v_no_wedge.dim() < gc0.dim():
+            v_no_wedge = v_no_wedge.unsqueeze(-2)
+        v_no_wedge = v_no_wedge.expand_as(gc0)
 
         # ---- Wedge: rigorous geometric formulation -------------------
         # The rotation axis tilts from z to n_hat = (sin W, 0, cos W).
@@ -844,9 +920,16 @@ class HEDMForwardModel(nn.Module):
         eta = self.safe_arccos(Gz_lab / r_yz)
         eta = -torch.sign(Gy_lab) * eta
 
-        # 2*theta  (broadcast thetas to match 2N dimension)
-        two_theta_single = 2.0 * thetas.unsqueeze(-2)  # (..., 1, M) or (1, M)
-        two_theta = two_theta_single.expand_as(all_omega)
+        # 2*theta -- broadcast to the single-branch (pre-cat) grid, then double
+        # along the grain axis to match all_omega's 2N. Layout-agnostic (handles
+        # the per_grain layout where the 2N axis is grain-doubled) and
+        # numerically identical to the former expand for the cross-product path
+        # (thetas does not depend on the orientation axis).
+        tt = 2.0 * thetas
+        while tt.dim() < omega_p.dim():
+            tt = tt.unsqueeze(-2)
+        tt = tt.expand_as(omega_p)
+        two_theta = torch.cat([tt, tt], dim=-2)
 
         # Validity mask
         valid_p = disc_valid & coswp_valid
@@ -1163,6 +1246,37 @@ class HEDMForwardModel(nn.Module):
             ydet_d = torch.stack(out_y, dim=0)
             zdet_d = torch.stack(out_z, dim=0)
 
+        # Ideal->raw radial distortion (canonical midas_distortion v2 model),
+        # applied on the BC-relative detector-plane coords (um) before pixel
+        # conversion -- mirrors midas_calibrate_v2.forward.geometry. Gated OFF
+        # by default so the indexer/fit-grain (ideal frame) are byte-unchanged;
+        # raw-patch consumers (pf_odf, grain_odf) opt in. R is BC-relative, so
+        # the distortion is frame-flip invariant; the eta convention (and any
+        # phase offset between the calibration frame and this frame) is the one
+        # thing to validate empirically (see implementation_plan_distortion_layer).
+        if self.apply_distortion and self._has_distortion:
+            from midas_distortion import apply_distortion as _apply_dist, \
+                v2_term_layout as _v2_terms, resolve_rho_d_um as _resolve_rho_d
+            eps = torch.tensor(1e-9, dtype=ydet_d.dtype, device=ydet_d.device)
+            R = torch.sqrt(ydet_d * ydet_d + zdet_d * zdet_d).clamp(min=eps)
+            # eta convention matches calibrate_v2 forward: atan2(-y, z), degrees.
+            eta_deg_d = self.RAD2DEG * torch.atan2(-ydet_d, zdet_d)
+            # resolve_rho_d_um passes a supplied rho_d through, or computes the
+            # max BC-relative corner distance (um) when None.
+            rho_d_val, _rho_how = _resolve_rho_d(
+                self.rho_d,
+                NrPixelsY=self.n_pixels_y, NrPixelsZ=self.n_pixels_z,
+                BC_y=float(self._y_BC.reshape(-1)[0]),
+                BC_z=float(self._z_BC.reshape(-1)[0]),
+                pxY=self.px,
+            )
+            rho_d_t = torch.as_tensor(float(rho_d_val), dtype=R.dtype, device=R.device)
+            p_v2 = self.p_distortion.to(R.dtype)
+            R_corr = _apply_dist(R, eta_deg_d, p_v2, rho_d_t, terms=_v2_terms())
+            scale = R_corr / R
+            ydet_d = ydet_d * scale
+            zdet_d = zdet_d * scale
+
         # FF/PF: y-axis on detector flipped (yBC - ydet/px), validated against C
         # NF:    not flipped (yBC + ydet/px), validated against C
         y_sign = -1.0 if self.flip_y else 1.0
@@ -1251,9 +1365,10 @@ class HEDMForwardModel(nn.Module):
         lattice_params : Tensor (..., 6) or (..., N, 6), optional
             Strained lattice parameters [a,b,c,alpha,beta,gamma] in
             Angstroms/degrees. None = use nominal hkls/thetas (no strain).
-        strain : Tensor (..., 6) or (..., N, 6), optional
-            Crystal-frame symmetric infinitesimal strain in Voigt form
-            [eps_11, eps_12, eps_13, eps_22, eps_23, eps_33]. Applied as
+        strain : Tensor (..., 6), (..., N, 6), or (..., 3, 3), optional
+            Crystal-frame symmetric infinitesimal strain, either PLAIN-Voigt
+            [eps_11, eps_12, eps_13, eps_22, eps_23, eps_33] or a full symmetric
+            3x3 tensor (see :meth:`strain_as_voigt`). Applied as
             B = (I + eps)^{-1} @ B0 in addition to any lattice-parameter
             strain expressed through ``lattice_params``. Requires
             ``lattice_params`` to be supplied.
@@ -1265,6 +1380,11 @@ class HEDMForwardModel(nn.Module):
         # Backward compat: pad (N,2) -> (N,3)
         if positions.shape[-1] == 2:
             positions = F.pad(positions, (0, 1), value=0.0)
+
+        # Footgun guard: per-grain lattice/strain + N>1 orientations forms an
+        # N x N orientation x strain cross-product (output (N, 2N, M)); callers
+        # simulating a fixed polycrystal almost always want only the diagonal.
+        self._warn_if_cross_product(euler_angles, lattice_params, strain)
 
         # 1. Orientation matrices
         orientation_matrices = self.euler2mat(euler_angles)
@@ -1289,6 +1409,102 @@ class HEDMForwardModel(nn.Module):
         spots = self.project_to_detector(omega, eta, two_theta, positions, valid)
 
         # 5. Scan filter (multi-scan only)
+        if self.scan_config is not None:
+            spots = self.filter_by_scan(spots, positions)
+
+        return spots
+
+    @staticmethod
+    def _warn_if_cross_product(euler_angles, lattice_params, strain):
+        """Warn when forward() would form an orientation x strain cross-product.
+
+        Fires only when there are N>1 orientations AND lattice_params/strain
+        carry a matching per-grain axis -- the case where the (N, 2N, M) output
+        is an N x N cross-product and the caller likely wanted the diagonal.
+        Shared lattice/strain (no grain axis) is the correct (2N, M) path and
+        does not warn.
+        """
+        n_orient = euler_angles.shape[-2] if euler_angles.dim() >= 2 else 1
+        if n_orient <= 1:
+            return
+
+        def _has_grain_axis(t):
+            if t is None:
+                return False
+            if t.shape[-1] == 6 and t.dim() >= 2:          # Voigt lattice or strain
+                return t.shape[-2] == n_orient
+            if tuple(t.shape[-2:]) == (3, 3) and t.dim() >= 3:  # full-tensor strain
+                return t.shape[-3] == n_orient
+            return False
+
+        if _has_grain_axis(lattice_params) or _has_grain_axis(strain):
+            warnings.warn(
+                f"forward() called with {n_orient} orientations and per-grain "
+                "lattice_params/strain forms an orientation x strain "
+                f"cross-product (output shape ({n_orient}, {2 * n_orient}, M)); "
+                "only the diagonal [i, i] and [i, i+N] is physical. For a fixed "
+                "polycrystal use forward_per_grain() (element-wise, O(N*M)), "
+                "or index the diagonal of this output.",
+                stacklevel=3,
+            )
+
+    def forward_per_grain(
+        self,
+        euler_angles: torch.Tensor,
+        positions: torch.Tensor,
+        lattice_params: Optional[torch.Tensor] = None,
+        strain: Optional[torch.Tensor] = None,
+    ) -> SpotDescriptors:
+        """Element-wise per-grain forward simulation -- the fast path.
+
+        Grain ``i`` is simulated with orientation ``i``, lattice/strain ``i``
+        and position ``i``, WITHOUT the orientation x strain cross-product that
+        :meth:`forward` forms when both are per-grain. The output has leading
+        shape ``(2N, M)`` (the two omega branches doubled along the grain axis),
+        which is exactly the diagonal of :meth:`forward`'s ``(N, 2N, M)`` output
+        -- so gradient and gradient-free callers agree bit-for-bit.
+
+        Cost is O(N*M) rather than O(N^2 * M), matching the algorithm of the C
+        reference ``ForwardSimulationCompressed.c``. Fully differentiable and
+        device-portable; for pure forward simulation wrap the call in
+        ``torch.inference_mode()``.
+
+        Parameters
+        ----------
+        euler_angles : Tensor (N, 3)
+            Bunge ZXZ Euler angles (radians), one per grain. No leading batch.
+        positions : Tensor (N, 3) or (N, 2)
+            Real-space grain positions (micrometers).
+        lattice_params : Tensor (6,) or (N, 6), optional
+            Shared or per-grain lattice [a,b,c,alpha,beta,gamma] (Ang/deg).
+        strain : Tensor (6,), (N, 6), (3, 3), or (N, 3, 3), optional
+            Shared or per-grain crystal-frame strain (plain-Voigt or full 3x3).
+
+        Returns
+        -------
+        SpotDescriptors with leading shape ``(2N, M)``: grain ``i``'s two omega
+        solutions live at axis-(-2) indices ``i`` and ``i + N``.
+        """
+        if positions.shape[-1] == 2:
+            positions = F.pad(positions, (0, 1), value=0.0)
+
+        orientation_matrices = self.euler2mat(euler_angles)        # (N, 3, 3)
+
+        hkls_cart = None
+        thetas = None
+        if lattice_params is not None:
+            hkls_cart, thetas = self.correct_hkls_latc(lattice_params, strain=strain)
+        elif strain is not None:
+            raise ValueError(
+                "strain was supplied but lattice_params is None; strain "
+                "requires a reference lattice to apply (I + eps)^{-1} @ B0."
+            )
+
+        omega, eta, two_theta, valid = self.calc_bragg_geometry(
+            orientation_matrices, hkls_cart, thetas, per_grain=True
+        )
+        spots = self.project_to_detector(omega, eta, two_theta, positions, valid)
+
         if self.scan_config is not None:
             spots = self.filter_by_scan(spots, positions)
 

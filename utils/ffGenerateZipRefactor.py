@@ -1,7 +1,10 @@
 #!/usr/bin/env python
 
 import warnings
-import hdf5plugin  # registers Blosc and other HDF5 filters before h5py reads any file
+try:
+    import hdf5plugin  # noqa: F401  # registers Blosc/LZ4/Zstd HDF5 filters before h5py reads
+except ImportError:
+    pass  # only needed for Blosc-compressed inputs; plain HDF5 reads fine without it
 import h5py
 import numpy as np
 import os
@@ -414,7 +417,8 @@ def process_hdf5_scan(config, z_groups, zRoot):
             # (_enrich_zarr_with_metadata, GUI tools) can find any per-frame metadata
             # the source HDF5 carries (samX/samY/samRy under /SMS/, timestamps under
             # /misc/, detector temps under /Detector/, etc.) without us needing an
-            # allow-list that drifts when the beamline adds new groups.
+            # allow-list that drifts when the beamline adds new groups. Supersedes
+            # the earlier hardcoded ('misc', 'Detector', 'StorageRing') list.
             _ALREADY_HANDLED = {'instrument', 'measurement', 'exchange', 'analysis'}
             for grp_name in hf.keys():
                 if grp_name in _ALREADY_HANDLED:
