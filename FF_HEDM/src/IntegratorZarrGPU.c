@@ -10,6 +10,7 @@
 //
 
 #include "FileReader.h"
+#include "IntegratorZarrGPU_kernel.h"
 // CalibPeakFit.h removed — peak fitting unified in PeakFit.h
 #include "MapHeader.h"
 #include "PeakFit.h"
@@ -1630,6 +1631,37 @@ integration_start:
   int32_t dsz = NrPixelsY * NrPixelsZ * bytesPerPx;
   double presThis = 0, tempThis = 0, iThis = 0, i0This = 0;
   double t_integration = 0, t_0;
+
+  /* ── GPU integrator initialization ────────────────────────────────────
+   * One-time GPU setup: uploads Map.bin (pxList+nPxList), bin edges, and
+   * fires PrecomputeOffsets + PerFrameArr-fill kernels. The context is
+   * used by gpu_integrator_process_frame() inside the loop, and freed by
+   * gpu_integrator_teardown() after. */
+  GpuIntegratorCtx *gpu_ctx = NULL;
+  {
+    /* pxListCount = max(dataPos + nPixels) across all bins. Passed as bytes
+     * to the init API so it knows how large the AoS map to upload is. */
+    size_t pxListCount = 0;
+    for (size_t bi = 0; bi < bigArrSize; bi++) {
+      size_t endpos =
+          (size_t)nPxList[2 * bi + 1] + (size_t)nPxList[2 * bi];
+      if (endpos > pxListCount)
+        pxListCount = endpos;
+    }
+    gpu_ctx = gpu_integrator_init(
+        pxList, pxListCount * sizeof(struct data),
+        nPxList, bigArrSize,
+        NrPixelsY, NrPixelsZ,
+        nRBins, nEtaBins,
+        RBinsLow, RBinsHigh, EtaBinsLow, EtaBinsHigh,
+        px, Lsd, Lam,
+        /*doBinSort=*/1, GradientCorrection);
+    if (!gpu_ctx) {
+      fprintf(stderr, "GPU integrator init FAILED — aborting\n");
+      exit(1);
+    }
+  }
+
   for (i = 0; i < nFrames; i++) {
     if (chunkFiles > 0) {
       if ((i % chunkFiles) == 0) {
@@ -1706,73 +1738,46 @@ integration_start:
              "val=-1: %ld in map; val=-2: %ld in map\n",
              neg1_total, neg2_total);
     }
+    /* ── GPU-accelerated integration ─────────────────────────────────────
+     * Replaces the OMP compute region (bin gather + normalize) with a
+     * single kernel launch. Frame-0 PerFrameArr, bin-mask NaN poking, and
+     * host-side sumMatrix accumulation stay on the CPU. */
     t_0 = omp_get_wtime();
-#pragma omp parallel for schedule(dynamic, 64) private(j, k, l, Pos, nPixels, dataPos, Intensity,    \
-                                     totArea, ThisVal, testPos, ThisInt,       \
-                                     RMean, EtaMean)
-    for (j = 0; j < nRBins; j++) {
-      RMean = (RBinsLow[j] + RBinsHigh[j]) / 2;
-      for (k = 0; k < nEtaBins; k++) {
-        Pos = j * nEtaBins + k;
-        nPixels = nPxList[2 * Pos + 0];
-        dataPos = nPxList[2 * Pos + 1];
-        Intensity = 0;
-        totArea = 0;
-        for (l = 0; l < nPixels; l++) {
-          ThisVal = pxList[dataPos + l];
-          double read_y = ThisVal.y, read_z = ThisVal.z;
-          if (GradientCorrection && ThisVal.deltaR != 0.0f) {
-            double dy = ThisVal.y - BC_y;
-            double dz = ThisVal.z - BC_z;
-            double R = sqrt(dy * dy + dz * dz);
-            if (R > 1.0) {
-              read_y -= ThisVal.deltaR * dy / R;
-              read_z -= ThisVal.deltaR * dz / R;
-            }
-          }
-          int iy = (int)floorf(read_y);
-          int iz = (int)floorf(read_z);
-          double fy = read_y - iy, fz = read_z - iz;
-          if (iy < 0) { iy = 0; fy = 0; }
-          if (iy >= NrPixelsY - 1) { iy = NrPixelsY - 2; fy = 1; }
-          if (iz < 0) { iz = 0; fz = 0; }
-          if (iz >= NrPixelsZ - 1) { iz = NrPixelsZ - 2; fz = 1; }
-          double pixVal =
-              Image[(size_t)iz * NrPixelsY + iy] * (1 - fy) * (1 - fz) +
-              Image[(size_t)iz * NrPixelsY + iy + 1] * fy * (1 - fz) +
-              Image[(size_t)(iz + 1) * NrPixelsY + iy] * (1 - fy) * fz +
-              Image[(size_t)(iz + 1) * NrPixelsY + iy + 1] * fy * fz;
-          Intensity += pixVal * ThisVal.frac;
-          totArea += ThisVal.areaWeight;
-        }
-        if (Intensity != 0) {
-          if (Normalize == 1) {
-            Intensity /= totArea;
-          }
-        }
-        EtaMean = (EtaBinsLow[k] + EtaBinsHigh[k]) / 2;
-        if (i == 0) {
-          PerFrameArr[0 * bigArrSize + (j * nEtaBins + k)] = RMean;
-          PerFrameArr[1 * bigArrSize + (j * nEtaBins + k)] =
-              atand(RMean * px / Lsd);
-          PerFrameArr[2 * bigArrSize + (j * nEtaBins + k)] = EtaMean;
-          PerFrameArr[3 * bigArrSize + (j * nEtaBins + k)] = totArea;
-          double twoTheta_rad = atan(RMean * px / Lsd);
-          PerFrameArr[4 * bigArrSize + (j * nEtaBins + k)] =
-              (Lam > 0) ? (4.0 * M_PI / Lam) * sin(twoTheta_rad / 2.0) : 0.0;
-        }
-        IntArrPerFrame[j * nEtaBins + k] = Intensity;
-        // If this bin is flagged as contaminated by a masked pixel, force NAN
-        if (binMaskFlag != NULL && binMaskFlag[j * nEtaBins + k])
-          IntArrPerFrame[j * nEtaBins + k] = NAN;
-        if (sumImages == 1) {
+    if (gpu_integrator_process_frame(gpu_ctx, Image, IntArrPerFrame, Normalize,
+                                     /*sumImages_gpu=*/0, /*frameIdx=*/i,
+                                     (float)BC_y, (float)BC_z) != 0) {
+      fprintf(stderr, "GPU integrator frame %d FAILED\n", i);
+      exit(1);
+    }
+    if (i == 0) {
+      /* GPU's init already populated dPerFrame on device with the same
+       * R / 2theta / eta / area / Q values the OMP loop wrote inline; copy
+       * back once so downstream /REtaMap HDF5 writes see the right data. */
+      if (gpu_integrator_copy_perframe_arr(gpu_ctx, PerFrameArr) != 0) {
+        fprintf(stderr, "GPU PerFrameArr copy-back FAILED\n");
+        exit(1);
+      }
+    }
+    if (binMaskFlag != NULL) {
+      for (size_t bi = 0; bi < bigArrSize; bi++) {
+        if (binMaskFlag[bi])
+          IntArrPerFrame[bi] = NAN;
+      }
+    }
+    if (sumImages == 1) {
+      /* Host-side sumMatrix accumulation. GPU kernel doesn't populate it
+       * (sumImages_gpu=0 above); we reconstruct from PerFrameArr on i==0
+       * and accumulate IntArrPerFrame every frame — matches OMP behavior. */
+      for (int j2 = 0; j2 < nRBins; j2++) {
+        for (int k2 = 0; k2 < nEtaBins; k2++) {
+          size_t bidx = (size_t)j2 * nEtaBins + k2;
           if (i == 0) {
-            sumMatrix[j * nEtaBins * 5 + k * 5 + 0] = RMean;
-            sumMatrix[j * nEtaBins * 5 + k * 5 + 1] = atand(RMean * px / Lsd);
-            sumMatrix[j * nEtaBins * 5 + k * 5 + 2] = EtaMean;
-            sumMatrix[j * nEtaBins * 5 + k * 5 + 4] = totArea;
+            sumMatrix[bidx * 5 + 0] = PerFrameArr[0 * bigArrSize + bidx];
+            sumMatrix[bidx * 5 + 1] = PerFrameArr[1 * bigArrSize + bidx];
+            sumMatrix[bidx * 5 + 2] = PerFrameArr[2 * bigArrSize + bidx];
+            sumMatrix[bidx * 5 + 4] = PerFrameArr[3 * bigArrSize + bidx];
           }
-          sumMatrix[j * nEtaBins * 5 + k * 5 + 3] += Intensity;
+          sumMatrix[bidx * 5 + 3] += IntArrPerFrame[bidx];
         }
       }
     }
@@ -2195,6 +2200,7 @@ integration_start:
     pfio_free_buffer(&h5buf);
   }
   free(RBinCenters);
+  gpu_integrator_teardown(gpu_ctx);
   end0 = clock();
   diftotal = ((double)(end0 - start0)) / CLOCKS_PER_SEC;
   printf("Total time elapsed:\t%f s.\n", diftotal);
