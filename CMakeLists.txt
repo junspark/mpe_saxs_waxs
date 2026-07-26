@@ -363,22 +363,55 @@ if(NOT ZLIB_FOUND AND DOWNLOAD_DEPENDENCIES AND NOT TARGET ZLIB::ZLIB)
   # but does NOT create ZLIB::ZLIB or set ZLIB_LIBRARY / ZLIB_INCLUDE_DIR.
   # We must do this ourselves so that all downstream find_package(ZLIB)
   # calls (in Blosc2, libtiff, HDF5, libzip) succeed.
+  #
+  # Use a SHARED/STATIC IMPORTED target (not an ALIAS, not INTERFACE
+  # IMPORTED wrapping the built target): the fetched deps (libtiff, libzip,
+  # blosc2) call target_link_libraries(x PRIVATE ZLIB::ZLIB) directly, and
+  # CMake's Makefile generator turns that into a file prerequisite. ALIAS
+  # emits the literal ALIAS name ("ZLIB::ZLIB") which Make rejects for the
+  # "::"; INTERFACE IMPORTED wrapping the 'zlib' target propagates the raw
+  # target name ("zlib") which Make also can't find a rule for. Only a
+  # SHARED/STATIC IMPORTED target with IMPORTED_LOCATION set to the actual
+  # output path resolves to a valid file prereq at generate time.
+  # Build-order dependency comes from add_dependencies() in the fetched
+  # deps' cmake wrappers (e.g. BLOSC_custom.cmake).
   if(NOT TARGET ZLIB::ZLIB)
     if(TARGET zlib)
-      add_library(ZLIB::ZLIB ALIAS zlib)
-      message(STATUS "Created ZLIB::ZLIB as alias for fetched 'zlib' target.")
+      set(_zlib_underlying zlib)
+      add_library(ZLIB::ZLIB SHARED IMPORTED GLOBAL)
+      # Fetched zlib sets OUTPUT_NAME=z and installs into ${CMAKE_BINARY_DIR}/lib
+      # as libz.so.<VERSION>. Compute the versioned path now so cmake's Makefile
+      # generator can emit it as a resolvable file prerequisite instead of a
+      # raw target name — IMPORTED_LOCATION does not evaluate generator
+      # expressions in the file-prereq context.
+      set(_zlib_impl "${CMAKE_BINARY_DIR}/lib/libz.so.${ZLIB_VERSION_STRING}")
     elseif(TARGET zlibstatic)
-      add_library(ZLIB::ZLIB ALIAS zlibstatic)
-      message(STATUS "Created ZLIB::ZLIB as alias for fetched 'zlibstatic' target.")
+      set(_zlib_underlying zlibstatic)
+      add_library(ZLIB::ZLIB STATIC IMPORTED GLOBAL)
+      set(_zlib_impl "${CMAKE_BINARY_DIR}/lib/libz.a")
+    endif()
+    if(TARGET ${_zlib_underlying})
+      set_target_properties(ZLIB::ZLIB PROPERTIES
+        IMPORTED_LOCATION "${_zlib_impl}"
+        INTERFACE_INCLUDE_DIRECTORIES
+          "${zlib_fetch_SOURCE_DIR};${zlib_fetch_BINARY_DIR}")
+      # Guarantee build ordering: consumers linking against ZLIB::ZLIB must
+      # wait for the underlying zlib target to produce its output file.
+      # add_dependencies() on IMPORTED targets is a no-op, so callers use
+      # add_dependencies(consumer ${_zlib_underlying}) — done here for the
+      # common consumers (blosc/tiff/hdf5/zip via their _custom.cmake shims).
+      message(STATUS "Created ZLIB::ZLIB as IMPORTED wrapping fetched '${_zlib_underlying}' target at ${_zlib_impl}.")
     endif()
   endif()
 
   # Populate the variables that find_package(ZLIB) would normally set.
-  # Use the ZLIB::ZLIB target name (not a bare "zlib" or a file path) so that
-  # downstream deps that do target_link_libraries(... ${ZLIB_LIBRARY}) get a
-  # proper CMake target reference.  Our custom FindZLIB.cmake (in FindModules/)
-  # ensures that subsequent find_package(ZLIB) calls inside deps short-circuit
-  # when ZLIB::ZLIB already exists, avoiding re-search failures.
+  # Use ZLIB::ZLIB (our IMPORTED target with IMPORTED_LOCATION set above)
+  # so downstream deps like blosc, libtiff, hdf5 and libzip that route
+  # ${ZLIB_LIBRARY} through target_link_libraries() get a target whose
+  # IMPORTED_LOCATION resolves to the actual libz.so file. Neither an ALIAS
+  # ("::" is invalid in Make prereqs) nor a bare target name ("zlib" is
+  # emitted as an unresolved file prereq) works in the Makefile generator's
+  # file-prereq codepath.
   set(ZLIB_LIBRARY ZLIB::ZLIB CACHE STRING "Zlib library target" FORCE)
   set(ZLIB_LIBRARIES ZLIB::ZLIB)
   # Also cache ZLIB_LIBRARY_RELEASE so that any FindZLIB.cmake that uses

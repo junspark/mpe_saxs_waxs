@@ -23,8 +23,12 @@ if(TARGET ZLIB::ZLIB)
   endif()
   set(ZLIB_INCLUDE_DIRS "${ZLIB_INCLUDE_DIR}")
 
-  # ZLIB_LIBRARY / ZLIB_LIBRARIES: use the target name so that
-  # target_link_libraries() resolves it as a CMake target dependency.
+  # ZLIB_LIBRARY / ZLIB_LIBRARIES: return the ZLIB::ZLIB IMPORTED target,
+  # which resolves through IMPORTED_LOCATION to the actual libz.so file path
+  # in the Makefile generator's file-prereq context. Neither an ALIAS name
+  # ("::" breaks Make) nor a bare target name ("zlib" becomes an unresolved
+  # file prereq) works in that context — only an IMPORTED target with a
+  # concrete IMPORTED_LOCATION does.
   if(NOT ZLIB_LIBRARY)
     set(ZLIB_LIBRARY ZLIB::ZLIB)
   endif()
