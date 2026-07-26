@@ -233,6 +233,15 @@ target_link_libraries(findMultipleSolutionsPF PRIVATE midas_orientation)
 add_ff_hedm_executable(mergeScansScanning SOURCES src/mergeScansScanning.c OMP)
 
 # CUDA specific targets
+# GPU port of IntegratorZarrOMP.
+# Host code lives in IntegratorZarrGPU.c (compiled as C, no C++ malloc-cast noise
+# vs OMP.c source-of-truth). CUDA kernels + C-callable API live in
+# IntegratorZarrGPU_kernel.cu (compiled by nvcc). See plan
+# ~/.claude/plans/hazy-swimming-lantern.md for design.
+add_ff_hedm_executable(IntegratorZarrGPU SOURCES src/IntegratorZarrGPU.c src/IntegratorZarrGPU_kernel.cu src/ZarrReader.c src/PeakFitIO.c src/FileReader.c CUDA OMP)
+if(TARGET IntegratorZarrGPU)
+  target_link_libraries(IntegratorZarrGPU PRIVATE midas_integration cudart)
+endif()
 add_ff_hedm_executable(IntegratorFitPeaksGPUStream SOURCES src/IntegratorFitPeaksGPUStream.cu src/PeakFit.c src/PeakFitIO.c CUDA OMP)
 add_ff_hedm_executable(IndexerGPU SOURCES src/IndexerGPU.cu CUDA OMP)
 if(TARGET IndexerGPU)
@@ -276,7 +285,7 @@ set(FF_HEDM_ALL_NON_CUDA_TARGETS_LIST
 add_custom_target(midas_ff_hedm_all_executables DEPENDS ${FF_HEDM_ALL_NON_CUDA_TARGETS_LIST} )
 
 if(USE_CUDA)
- add_dependencies(midas_ff_hedm_all_executables IntegratorFitPeaksGPUStream)
+ add_dependencies(midas_ff_hedm_all_executables IntegratorZarrGPU IntegratorFitPeaksGPUStream)
  # Add other CUDA targets here if re-enabled:
  # add_dependencies(midas_ff_hedm_all_executables IndexerCUDA PeaksCUDA)
 endif()
