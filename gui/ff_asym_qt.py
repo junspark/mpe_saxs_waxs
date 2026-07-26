@@ -711,35 +711,45 @@ class FFViewer(QtWidgets.QMainWindow):
         self.image_view.levelsChanged.connect(self._on_hist_levels_dragged)
 
         # ── Control Panels ──
-        # Built here first so they can go inside the detachable Controls
-        # dock (below). Stack the single/multi-detector Data Source panels;
-        # the toolbar Multi-Det checkbox swaps which one is visible.
-        ctrl = QtWidgets.QHBoxLayout()
-        ctrl.setContentsMargins(0, 0, 0, 0)
-        ctrl.setSpacing(4)
+        # Bottom controls as a QTabWidget rather than a horizontal strip:
+        # only one section visible at a time → zero horizontal scrolling on
+        # laptop screens regardless of dock width. Default tab is "Image &
+        # Display" because it holds the frame navigator and aggregation
+        # toggles that get used every image. "Data Source" and "Cake /
+        # Processing" are click-once-per-session so tabbing them away is
+        # cheap. All internal state (file_stack single/multi swap,
+        # frame_spin, etc.) still lives on FFViewer attrs; the tab widget
+        # is just a visual container.
         self._file_stack = QtWidgets.QStackedWidget()
         self._file_stack.addWidget(self._build_file_panel())     # 0: single
         self._file_stack.addWidget(self._build_multi_panel())    # 1: multi
-        ctrl.addWidget(self._file_stack, stretch=3)
-        ctrl.addWidget(self._build_image_display_panel(), stretch=3)
-        ctrl.addWidget(self._build_processing_panel(), stretch=2)
-        ctrl_widget = QtWidgets.QWidget()
-        ctrl_widget.setLayout(ctrl)
 
-        # Wrap the controls in a scroll area so the effective minimum stays
-        # small (~one row). Users can shrink the dock without hitting the
-        # multi-detector panel's full-height floor; scrollbar takes over
-        # when content exceeds visible area. Horizontal scroll enabled too
-        # (used to be AlwaysOff for the splitter layout) so the panel keeps
-        # its horizontal footprint when floated to a narrow window rather
-        # than truncating right-side sections.
-        ctrl_scroll = QtWidgets.QScrollArea()
-        ctrl_scroll.setWidget(ctrl_widget)
-        ctrl_scroll.setWidgetResizable(True)
-        ctrl_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        ctrl_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        ctrl_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        ctrl_scroll.setMinimumHeight(80)
+        def _wrap_scroll(inner):
+            """Per-tab scroll wrapper — keeps the tab bar pinned while the
+            tab's content scrolls independently when the dock is short."""
+            sa = QtWidgets.QScrollArea()
+            sa.setWidget(inner)
+            sa.setWidgetResizable(True)
+            sa.setFrameShape(QtWidgets.QFrame.NoFrame)
+            sa.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            sa.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            return sa
+
+        ctrl_widget = QtWidgets.QTabWidget()
+        ctrl_widget.setObjectName("ff_controls_tabs")
+        ctrl_widget.setDocumentMode(True)  # flatter tabs, less chrome
+        ctrl_widget.addTab(_wrap_scroll(self._build_image_display_panel()),
+                           "&Image / Display")
+        ctrl_widget.addTab(_wrap_scroll(self._file_stack), "&Data Source")
+        ctrl_widget.addTab(_wrap_scroll(self._build_processing_panel()),
+                           "&Cake / Processing")
+        ctrl_widget.setCurrentIndex(0)  # Image & Display is the default tab
+
+        # Ensure the dock doesn't shrink below one tab bar + a row of
+        # controls. Each tab has its own QScrollArea (_wrap_scroll above)
+        # so per-tab content that exceeds available height scrolls without
+        # dragging the tab bar with it.
+        ctrl_widget.setMinimumHeight(80)
 
         # Image now goes directly into main_layout. Controls live in a
         # detachable QDockWidget (BottomDockWidgetArea by default) so users
@@ -751,7 +761,7 @@ class FFViewer(QtWidgets.QMainWindow):
 
         self._controls_dock = QtWidgets.QDockWidget("Controls", self)
         self._controls_dock.setObjectName("ff_controls_dock")
-        self._controls_dock.setWidget(ctrl_scroll)
+        self._controls_dock.setWidget(ctrl_widget)
         self._controls_dock.setFeatures(
             QtWidgets.QDockWidget.DockWidgetMovable |
             QtWidgets.QDockWidget.DockWidgetFloatable |
