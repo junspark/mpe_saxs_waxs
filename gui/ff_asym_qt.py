@@ -489,6 +489,12 @@ def compute_ring_points(ring_rad, lsd_local, lsd_orig, bc, px,
 class FFViewer(QtWidgets.QMainWindow):
     """FF-HEDM image viewer with reactive controls and ring overlays."""
 
+    # Emitted when the toolbar's font-size combo changes. Payload is the
+    # new size in points. Companion launchers (Caking, BC, Data Explorer)
+    # subscribe so their own fonts follow the viewer's — one source of
+    # truth for font size across the whole session.
+    fontSizeChanged = QtCore.pyqtSignal(int)
+
     def __init__(self, theme='light', auto_detect=True):
         super().__init__()
         self.setWindowTitle("FF Viewer (PyQtGraph) — MIDAS")
@@ -2701,6 +2707,9 @@ class FFViewer(QtWidgets.QMainWindow):
         # pyqtgraph TextItems also don't pick up the stylesheet — redraw axes.
         if self.show_axes:
             self._draw_axes()
+        # Notify companion launchers (Caking, BC, Data Explorer) so their
+        # own Qt widget fonts and matplotlib rcParams follow.
+        self.fontSizeChanged.emit(int(size))
 
     def _on_frame_scroll(self, delta):
         self.frame_spin.setValue(self.frame_spin.value() + delta)
