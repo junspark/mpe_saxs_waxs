@@ -855,6 +855,9 @@ class FFViewer(QtWidgets.QMainWindow):
         self.cmap_combo = QtWidgets.QComboBox()
         self.cmap_combo.addItems(COLORMAPS)
         self.cmap_combo.setCurrentText('inferno')
+        self.cmap_combo.setToolTip(
+            "Colour map for the image. 'inferno' is a good default "
+            "for X-ray intensity (perceptually uniform, dark = low).")
         tb.addWidget(self.cmap_combo)
 
         # Theme
@@ -862,14 +865,22 @@ class FFViewer(QtWidgets.QMainWindow):
         self.theme_combo = QtWidgets.QComboBox()
         self.theme_combo.addItems(['light', 'dark'])
         self.theme_combo.setCurrentText(self._theme)
+        self.theme_combo.setToolTip(
+            "Widget theme. 'light' for bright rooms, 'dark' for low light.")
         tb.addWidget(self.theme_combo)
 
         # Log
         self.log_check = QtWidgets.QCheckBox("Log")
+        self.log_check.setToolTip(
+            "Display intensity on a log scale — reveals weak features "
+            "alongside strong peaks (high dynamic range).")
         tb.addWidget(self.log_check)
 
         # Rings
         self.rings_check = QtWidgets.QCheckBox("Rings")
+        self.rings_check.setToolTip(
+            "Overlay calibrant rings at the current Lsd, BC, and 2θ. "
+            "Configure the material via the Detector panel's 'Rings Material'.")
         tb.addWidget(self.rings_check)
 
         # Lab-frame axes
@@ -917,19 +928,32 @@ class FFViewer(QtWidgets.QMainWindow):
         self.composite_combo.addItems(['max', 'sum'])
         self.composite_combo.setCurrentText(self.composite_op)
         self.composite_combo.setEnabled(False)   # only meaningful in multi-mode
+        self.composite_combo.setToolTip(
+            "Multi-detector composite operation. 'max': brightest pixel per "
+            "location; 'sum': total intensity across overlapping panels. "
+            "Only enabled in HYDRA / multi-panel mode.")
         tb.addWidget(self.composite_combo)
 
         # Intensity controls (moved from Display panel)
         tb.addWidget(QtWidgets.QLabel("Min I:"))
         self.min_intensity_edit = QtWidgets.QLineEdit("0")
         self.min_intensity_edit.setMinimumWidth(110)
+        self.min_intensity_edit.setToolTip(
+            "Lower intensity clamp for display. Values below this render "
+            "at the coldest colour. Ignored on Log scale.")
         tb.addWidget(self.min_intensity_edit)
         tb.addWidget(QtWidgets.QLabel("Max I:"))
         self.max_intensity_edit = QtWidgets.QLineEdit("1000")
         self.max_intensity_edit.setMinimumWidth(110)
+        self.max_intensity_edit.setToolTip(
+            "Upper intensity clamp for display. Values above this render "
+            "at the hottest colour. Tune to bring rings out of noise.")
         tb.addWidget(self.max_intensity_edit)
         apply_btn = QtWidgets.QPushButton("Apply")
         apply_btn.clicked.connect(self._apply_intensity_levels)
+        apply_btn.setToolTip(
+            "Apply the Min I / Max I edits to the image. Enter in either "
+            "field does the same.")
         self.min_intensity_edit.returnPressed.connect(self._apply_intensity_levels)
         self.max_intensity_edit.returnPressed.connect(self._apply_intensity_levels)
         tb.addWidget(apply_btn)
@@ -937,16 +961,22 @@ class FFViewer(QtWidgets.QMainWindow):
         # Export
         export_btn = QtWidgets.QPushButton("Export PNG")
         export_btn.clicked.connect(lambda: self.image_view.export_png())
+        export_btn.setToolTip(
+            "Save the current image view (with overlays) as a PNG file.")
         tb.addWidget(export_btn)
 
         # Toggle log panel
         log_btn = QtWidgets.QPushButton("Log Panel")
         log_btn.setCheckable(True)
         log_btn.toggled.connect(lambda c: self.log_panel.show() if c else self.log_panel.hide())
+        log_btn.setToolTip(
+            "Show/hide the log-output dock at the bottom of the window.")
         tb.addWidget(log_btn)
 
         help_btn = QtWidgets.QPushButton("Help")
         help_btn.clicked.connect(self._show_help)
+        help_btn.setToolTip(
+            "Show mouse and keyboard shortcuts for the viewer.")
         tb.addWidget(help_btn)
 
         tb.addStretch()
@@ -963,6 +993,10 @@ class FFViewer(QtWidgets.QMainWindow):
         self.font_size_combo.setCurrentText(str(self.font_spin.value()))
         self.font_size_combo.setFixedWidth(50)
         self.font_size_combo.currentTextChanged.connect(self._on_font_size_changed)
+        self.font_size_combo.setToolTip(
+            "Widget font size (pt). Applies to this viewer and to any "
+            "companion launcher windows (Caking, BC, Data Explorer). "
+            "Editable — type any value between 8 and 36.")
         tb.addWidget(self.font_size_combo)
 
         return tb
@@ -994,46 +1028,76 @@ class FFViewer(QtWidgets.QMainWindow):
         btn_first = QtWidgets.QPushButton("First File")
         btn_first.clicked.connect(self._on_first_file)
         btn_first.setFixedWidth(90)
+        btn_first.setToolTip(
+            "Choose the first data file of a scan. The filename determines "
+            "the file-number pattern (folder/stem_NNNNNN.ext) that File Nr "
+            "then increments through.")
         lay.addWidget(btn_first, 0, 0)
 
         btn_dark = QtWidgets.QPushButton("Dark File")
         btn_dark.clicked.connect(self._on_dark_file)
         btn_dark.setFixedWidth(90)
+        btn_dark.setToolTip(
+            "Choose a dark-current reference file. The 'Dark' checkbox "
+            "then subtracts it (averaged across frames) from every image.")
         lay.addWidget(btn_dark, 0, 1)
 
         self.dark_check = QtWidgets.QCheckBox("Dark")
+        self.dark_check.setToolTip(
+            "Subtract the dark reference from displayed images. Requires "
+            "a Dark File to be loaded first.")
         lay.addWidget(self.dark_check, 0, 2)
 
         btn_zip = QtWidgets.QPushButton("Load ZIP")
         btn_zip.clicked.connect(self._on_load_zip)
+        btn_zip.setToolTip(
+            "Load a .MIDAS.zip archive (dark + data + params rolled into "
+            "one file). Auto-populates the data path and Dark reference.")
         lay.addWidget(btn_zip, 0, 3)
 
         self.dark_label = QtWidgets.QLabel("")
         self.dark_label.setStyleSheet("color: gray; font-size: 9pt;")
         lay.addWidget(self.dark_label, 0, 4)
 
-        lay.addWidget(QtWidgets.QLabel("File Nr"), 1, 0)
+        lbl_fnr = QtWidgets.QLabel("File Nr")
+        lay.addWidget(lbl_fnr, 1, 0)
         self.file_nr_edit = QtWidgets.QLineEdit(str(self.first_file_nr))
         self.file_nr_edit.setMinimumWidth(70)
+        self.file_nr_edit.setToolTip(
+            "Numeric portion of the current filename (folder/stem_NNNNNN.ext). "
+            "Type a number to jump; scroll wheel over the image changes it.")
         lay.addWidget(self.file_nr_edit, 1, 1)
 
-        lay.addWidget(QtWidgets.QLabel("Frames/File"), 1, 2)
+        lbl_frames = QtWidgets.QLabel("Frames/File")
+        lay.addWidget(lbl_frames, 1, 2)
         self.nframes_edit = QtWidgets.QLineEdit("1")
         self.nframes_edit.setMinimumWidth(70)
+        self.nframes_edit.setToolTip(
+            "How many image frames each file contains. Typically 1 (per-file "
+            "raw) or N (HDF5 multi-frame stack).")
         lay.addWidget(self.nframes_edit, 1, 3)
 
-        lay.addWidget(QtWidgets.QLabel("H5 Data"), 2, 0)
+        lbl_h5d = QtWidgets.QLabel("H5 Data")
+        lay.addWidget(lbl_h5d, 2, 0)
         self.h5data_edit = QtWidgets.QLineEdit(self.hdf5_data_path)
+        self.h5data_edit.setToolTip(
+            "HDF5 dataset path holding the image stack, e.g. '/exchange/data' "
+            "or '/entry/data/data'. Ignored for non-HDF5 formats.")
         lay.addWidget(self.h5data_edit, 2, 1, 1, 3)
 
-        lay.addWidget(QtWidgets.QLabel("Mask"), 3, 0)
+        lbl_mask = QtWidgets.QLabel("Mask")
+        lay.addWidget(lbl_mask, 3, 0)
         mask_cell = QtWidgets.QHBoxLayout()
         mask_cell.setContentsMargins(0, 0, 0, 0)
         mask_cell.setSpacing(4)
         self.mask_edit = QtWidgets.QLineEdit("")
+        self.mask_edit.setToolTip(
+            "Path to a TIFF mask file (non-zero = masked). Applied to every "
+            "displayed frame when 'Apply' is checked.")
         mask_cell.addWidget(self.mask_edit, 1)
         btn_mask_browse = QtWidgets.QPushButton("Browse")
         btn_mask_browse.clicked.connect(self._on_browse_mask)
+        btn_mask_browse.setToolTip("Browse for an existing mask TIFF.")
         mask_cell.addWidget(btn_mask_browse)
         btn_mask_build = QtWidgets.QPushButton("Build…")
         btn_mask_build.setToolTip(
@@ -1044,10 +1108,17 @@ class FFViewer(QtWidgets.QMainWindow):
         mask_cell.addWidget(btn_mask_build)
         lay.addLayout(mask_cell, 3, 1, 1, 2)
         self.mask_check = QtWidgets.QCheckBox("Apply")
+        self.mask_check.setToolTip(
+            "Apply the mask above to displayed images. Masked pixels render "
+            "as transparent/black; downstream caking will skip them.")
         lay.addWidget(self.mask_check, 3, 3)
 
-        lay.addWidget(QtWidgets.QLabel("H5 Dark"), 4, 0)
+        lbl_h5dark = QtWidgets.QLabel("H5 Dark")
+        lay.addWidget(lbl_h5dark, 4, 0)
         self.h5dark_edit = QtWidgets.QLineEdit(self.hdf5_dark_path)
+        self.h5dark_edit.setToolTip(
+            "HDF5 dataset path for the dark reference stack. Often the same "
+            "as H5 Data with '/data' → '/dark' — e.g. '/exchange/dark'.")
         lay.addWidget(self.h5dark_edit, 4, 1, 1, 3)
 
         # Load Params + Instr only relocated to Detector & Rings panel
@@ -1145,6 +1216,19 @@ class FFViewer(QtWidgets.QMainWindow):
         cake_lbl.setStyleSheet("font-weight: bold;")
         cl.addWidget(cake_lbl, 2, 0)
 
+        # Concrete per-column help so the row of nine anonymous edits is
+        # actually usable. Matches CAKE_KEYS order.
+        _CAKE_TIPS = {
+            'R_MIN':     "Inner radial edge of the cake (pixels).",
+            'R_MAX':     "Outer radial edge of the cake (pixels).",
+            'R_STEP':    "Radial bin size (pixels). Typical 0.25–2.",
+            'ETA_MIN':   "Start azimuth in degrees. −180 to +180 range.",
+            'ETA_MAX':   "End azimuth in degrees. Full ring = −180 to 180.",
+            'ETA_STEP':  "Azimuthal bin size (degrees). Typical 1–5.",
+            'OME_SUM':   "Number of ω frames to sum per cake output frame.",
+            'OME_START': "First ω (rotation) angle of the scan, in degrees.",
+            'OME_STEP':  "ω step between consecutive frames, in degrees.",
+        }
         self._single_cake_edits = {}
         det = self._SINGLE_CAKE_DET
         for col, key in enumerate(self.CAKE_KEYS):
@@ -1152,6 +1236,7 @@ class FFViewer(QtWidgets.QMainWindow):
             e.setMinimumWidth(80)
             e.setAlignment(QtCore.Qt.AlignRight)
             e.setPlaceholderText("—")
+            e.setToolTip(_CAKE_TIPS.get(key, ''))
             cl.addWidget(e, 2, col + 1)
             e.textEdited.connect(
                 lambda _txt, d=det, k=key, ed=e:
@@ -1254,11 +1339,17 @@ class FFViewer(QtWidgets.QMainWindow):
         lay.addWidget(QtWidgets.QLabel("Pixels H"), 0, 0)
         self.nz_edit = QtWidgets.QLineEdit(str(self.nz))
         self.nz_edit.setFixedWidth(55)
+        self.nz_edit.setToolTip(
+            "Detector width in pixels. Typical: Pilatus 981, Varex 2880, "
+            "GE 2048, Eiger 1030.")
         lay.addWidget(self.nz_edit, 0, 1)
 
         lay.addWidget(QtWidgets.QLabel("Pixels V"), 0, 2)
         self.ny_edit = QtWidgets.QLineEdit(str(self.ny))
         self.ny_edit.setFixedWidth(55)
+        self.ny_edit.setToolTip(
+            "Detector height in pixels. Usually equal to Pixels H for "
+            "square panels.")
         lay.addWidget(self.ny_edit, 0, 3)
 
         lay.addWidget(QtWidgets.QLabel("Display Frame"), 0, 4)
@@ -1269,6 +1360,9 @@ class FFViewer(QtWidgets.QMainWindow):
         self.frame_spin = QtWidgets.QSpinBox()
         self.frame_spin.setRange(0, 99999)
         self.frame_spin.setValue(0)
+        self.frame_spin.setToolTip(
+            "Which frame index inside the current file to display. Wheel "
+            "over the image also increments/decrements.")
         frame_row.addWidget(self.frame_spin)
         self.frame_max_label = QtWidgets.QLabel("/ —")
         self.frame_max_label.setToolTip(
@@ -1282,24 +1376,41 @@ class FFViewer(QtWidgets.QMainWindow):
         lay.addWidget(QtWidgets.QLabel("Header"), 1, 0)
         self.header_edit = QtWidgets.QLineEdit(str(self.header_size))
         self.header_edit.setFixedWidth(55)
+        self.header_edit.setToolTip(
+            "Bytes to skip at the start of a raw binary file before the "
+            "pixel data begins. GE detectors: 8192. Ignored for HDF5/TIFF.")
         lay.addWidget(self.header_edit, 1, 1)
 
         lay.addWidget(QtWidgets.QLabel("Bytes/Pixel"), 1, 2)
         self.bpp_edit = QtWidgets.QLineEdit(str(self.bytes_per_pixel))
         self.bpp_edit.setFixedWidth(35)
+        self.bpp_edit.setToolTip(
+            "Raw-binary pixel width in bytes. 2 = uint16, 4 = uint32/float32. "
+            "Ignored for HDF5/TIFF.")
         lay.addWidget(self.bpp_edit, 1, 3)
 
         # Row 2: pixel size + transforms
         lay.addWidget(QtWidgets.QLabel("Pixel Size (μm)"), 2, 0, 1, 2)
         self.px_edit = QtWidgets.QLineEdit(str(self.pixel_size))
         self.px_edit.setFixedWidth(55)
+        self.px_edit.setToolTip(
+            "Pixel edge length in micrometres. Typical: Pilatus 172, "
+            "Varex 150, GE 200, Eiger 75. Rescales the 2θ / d / q axes.")
         lay.addWidget(self.px_edit, 2, 2)
 
         self.hflip_check = QtWidgets.QCheckBox("HFlip")
+        self.hflip_check.setToolTip(
+            "Mirror the image horizontally at display time. Use to correct "
+            "detector orientation without touching Map.bin.")
         lay.addWidget(self.hflip_check, 2, 3)
         self.vflip_check = QtWidgets.QCheckBox("VFlip")
+        self.vflip_check.setToolTip(
+            "Mirror the image vertically at display time.")
         lay.addWidget(self.vflip_check, 2, 4)
         self.transpose_check = QtWidgets.QCheckBox("Transpose")
+        self.transpose_check.setToolTip(
+            "Swap image X and Y (rotate 90° via a swap). Combine with "
+            "HFlip/VFlip to cover the eight orientations.")
         lay.addWidget(self.transpose_check, 2, 5)
 
         # Row 3: aggregation controls — frame count + mutually-exclusive mode
@@ -1315,8 +1426,14 @@ class FFViewer(QtWidgets.QMainWindow):
         self.max_frames_spin.setToolTip(agg_label.toolTip())
         lay.addWidget(self.max_frames_spin, 3, 1)
         self.max_check = QtWidgets.QCheckBox("Max")
+        self.max_check.setToolTip(
+            "Per-pixel maximum across # Frames. Streams — memory-cheap. "
+            "Highlights the strongest signal seen at each pixel.")
         lay.addWidget(self.max_check, 3, 2)
         self.sum_check = QtWidgets.QCheckBox("Sum")
+        self.sum_check.setToolTip(
+            "Per-pixel sum across # Frames. Streams — memory-cheap. "
+            "Boosts weak features but saturates strong ones.")
         lay.addWidget(self.sum_check, 3, 3)
         self.avg_check = QtWidgets.QCheckBox("Average")
         self.avg_check.setToolTip(
@@ -1361,6 +1478,10 @@ class FFViewer(QtWidgets.QMainWindow):
         self._refine_tols: dict = {}
 
         btn_rings = QtWidgets.QPushButton("Rings Material")
+        btn_rings.setToolTip(
+            "Choose a calibrant (CeO2, LaB6, AgBe, Si, or custom d-spacings) "
+            "and generate the overlay-ring set. Fills the Rings checkbox in "
+            "the top toolbar with the newly-computed 2θ list.")
         btn_rings.clicked.connect(self._on_ring_selection)
         lay.addWidget(btn_rings, 0, 0)
         btn_arcfit = QtWidgets.QPushButton("Arc-fit BC/Lsd…")
@@ -1406,6 +1527,10 @@ class FFViewer(QtWidgets.QMainWindow):
         lay.addWidget(QtWidgets.QLabel("Lsd (μm)"), 1, 0)
         self.lsd_edit = QtWidgets.QLineEdit(str(self.lsd_local))
         self.lsd_edit.setMinimumWidth(100)
+        self.lsd_edit.setToolTip(
+            "Sample-to-detector distance in micrometres. Rings redraw on "
+            "edit — nudge until overlays sit on calibrant peaks. Typical: "
+            "300000–2000000 (30 cm to 2 m).")
         lay.addWidget(self.lsd_edit, 1, 1)
         _add_refine(1, 'Lsd', 25000,
                     'Sample-to-detector distance (µm). MIDAS default '
@@ -1414,6 +1539,9 @@ class FFViewer(QtWidgets.QMainWindow):
         lay.addWidget(QtWidgets.QLabel("Beam Ctr Y"), 2, 0)
         self.bcy_edit = QtWidgets.QLineEdit(str(self.bc_local[0]))
         self.bcy_edit.setMinimumWidth(90)
+        self.bcy_edit.setToolTip(
+            "Beam center Y coordinate in pixels (horizontal). Can be "
+            "negative or > NrPixels when the beam is off-detector.")
         lay.addWidget(self.bcy_edit, 2, 1)
         _add_refine(2, 'BC_Y', 20,
                     'Beam center Y (pixels). MIDAS refines BC_Y/BC_Z '
@@ -1422,6 +1550,9 @@ class FFViewer(QtWidgets.QMainWindow):
         lay.addWidget(QtWidgets.QLabel("Beam Ctr Z"), 3, 0)
         self.bcz_edit = QtWidgets.QLineEdit(str(self.bc_local[1]))
         self.bcz_edit.setMinimumWidth(90)
+        self.bcz_edit.setToolTip(
+            "Beam center Z coordinate in pixels (vertical). Detector origin "
+            "is bottom-left in the viewer.")
         lay.addWidget(self.bcz_edit, 3, 1)
         _add_refine(3, 'BC_Z', 20,
                     'Beam center Z (pixels). BC_Y/BC_Z refine as a '
