@@ -495,6 +495,16 @@ class FFViewer(QtWidgets.QMainWindow):
     # truth for font size across the whole session.
     fontSizeChanged = QtCore.pyqtSignal(int)
 
+    # Default font size for the viewer UI. Overridden by QSettings if the user
+    # has previously changed it via combo/spin/shortcut. Bumped from the Qt
+    # default (~9pt) to something comfortably readable on a modern laptop.
+    DEFAULT_FONT_SIZE = 11
+    FONT_MIN = 8
+    FONT_MAX = 36
+    # QSettings key namespace — org/app name pair that keys user preferences.
+    _QSETTINGS_ORG = "MIDAS"
+    _QSETTINGS_APP = "FFViewer"
+
     def __init__(self, theme='light', auto_detect=True):
         super().__init__()
         self.setWindowTitle("FF Viewer (PyQtGraph) — MIDAS")
@@ -711,82 +721,76 @@ class FFViewer(QtWidgets.QMainWindow):
         self.image_view.fontSizeChanged.connect(self._on_font_changed)
         self.image_view.levelsChanged.connect(self._on_hist_levels_dragged)
 
-        # ── Control Panels (built first so they can go in the splitter) ──
-        ctrl = QtWidgets.QHBoxLayout()
-        ctrl.setContentsMargins(0, 0, 0, 0)
-        ctrl.setSpacing(4)
-        # Stack the single-detector and multi-detector data-source panels;
-        # the toolbar Multi-Det checkbox swaps which one is visible.
+        # ── Control Panels ──
+        # Bottom controls as a QTabWidget rather than a horizontal strip:
+        # only one section visible at a time → zero horizontal scrolling on
+        # laptop screens regardless of dock width. Default tab is "Image &
+        # Display" because it holds the frame navigator and aggregation
+        # toggles that get used every image. "Data Source" and "Cake /
+        # Processing" are click-once-per-session so tabbing them away is
+        # cheap. All internal state (file_stack single/multi swap,
+        # frame_spin, etc.) still lives on FFViewer attrs; the tab widget
+        # is just a visual container.
         self._file_stack = QtWidgets.QStackedWidget()
         self._file_stack.addWidget(self._build_file_panel())     # 0: single
         self._file_stack.addWidget(self._build_multi_panel())    # 1: multi
-        ctrl.addWidget(self._file_stack, stretch=3)
-        ctrl.addWidget(self._build_image_display_panel(), stretch=3)
-        ctrl.addWidget(self._build_processing_panel(), stretch=2)
-        ctrl_widget = QtWidgets.QWidget()
-        ctrl_widget.setLayout(ctrl)
 
-        # Wrap the controls in a scroll area so:
-        #   - the bottom's *effective* minimum stays small (~one row),
-        #     letting the user shrink the window without hitting a tall
-        #     floor from the multi-detector panel's full content height,
-        #   - swapping the QStackedWidget page (single ↔ multi) or growing
-        #     content (cake editor, status labels) scrolls inside the
-        #     viewport instead of stealing height from the image area.
-        ctrl_scroll = QtWidgets.QScrollArea()
-        ctrl_scroll.setWidget(ctrl_widget)
-        ctrl_scroll.setWidgetResizable(True)
-        ctrl_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        ctrl_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        ctrl_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        # Let the user drag the splitter down to a small slice; the scroll
-        # area's vertical scrollbar takes over once the inner widget can't
-        # fit. Without this the splitter clamps to the controls' natural
-        # minimumSizeHint and the divider feels stuck.
-        ctrl_scroll.setMinimumHeight(80)
+        def _wrap_scroll(inner):
+            """Per-tab scroll wrapper — keeps the tab bar pinned while the
+            tab's content scrolls independently when the dock is short."""
+            sa = QtWidgets.QScrollArea()
+            sa.setWidget(inner)
+            sa.setWidgetResizable(True)
+            sa.setFrameShape(QtWidgets.QFrame.NoFrame)
+            sa.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            sa.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            return sa
 
-        # Vertical splitter so the image dominates at startup but the user
-        # can drag the divider for more controls space. Stretch factors
-        # 1:0 send any extra vertical space to the image, never the
-        # bottom. Initial bottom size is the controls' sizeHint capped at
-        # BOTTOM_INIT_CAP so the image gets a generous starting share even
-        # when the controls' natural height is large (multi-det panel,
-        # tall fonts); the user can drag the divider either way.
-        # Cap the initial controls-pane height at ~1/3 of the current
-        # window (proportional so laptop screens don't lose the image
-        # to a tall controls block); floor at 200 px so multi-detector
-        # rows aren't hidden on the first click.
+        ctrl_widget = QtWidgets.QTabWidget()
+        ctrl_widget.setObjectName("ff_controls_tabs")
+        ctrl_widget.setDocumentMode(True)  # flatter tabs, less chrome
+        ctrl_widget.addTab(_wrap_scroll(self._build_image_display_panel()),
+                           "&Image / Display")
+        ctrl_widget.addTab(_wrap_scroll(self._file_stack), "&Data Source")
+        ctrl_widget.addTab(_wrap_scroll(self._build_processing_panel()),
+                           "&Cake / Processing")
+        ctrl_widget.setCurrentIndex(0)  # Image & Display is the default tab
+
+        # Ensure the dock doesn't shrink below one tab bar + a row of
+        # controls. Each tab has its own QScrollArea (_wrap_scroll above)
+        # so per-tab content that exceeds available height scrolls without
+        # dragging the tab bar with it.
+        ctrl_widget.setMinimumHeight(80)
+
+        # Image now goes directly into main_layout. Controls live in a
+        # detachable QDockWidget (BottomDockWidgetArea by default) so users
+        # on laptop screens — where the fixed horizontal bottom strip was
+        # chopped and required horizontal scrolling — can drag it off to
+        # float as a free window, dock it at another edge, hide it, or
+        # resize by grabbing the dock's top edge. Toggle via View menu.
+        main_layout.addWidget(self.image_view, stretch=1)
+
+        self._controls_dock = QtWidgets.QDockWidget("Controls", self)
+        self._controls_dock.setObjectName("ff_controls_dock")
+        self._controls_dock.setWidget(ctrl_widget)
+        self._controls_dock.setFeatures(
+            QtWidgets.QDockWidget.DockWidgetMovable |
+            QtWidgets.QDockWidget.DockWidgetFloatable |
+            QtWidgets.QDockWidget.DockWidgetClosable)
+        self._controls_dock.setAllowedAreas(QtCore.Qt.AllDockWidgetAreas)
+        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self._controls_dock)
+
+        # Cap the initial dock height at ~1/3 of the window (proportional
+        # so laptop screens don't lose the image to a tall controls block);
+        # floor at 200 px so multi-detector rows aren't hidden on first
+        # launch. Mirrors the pre-refactor BOTTOM_INIT_CAP splitter logic.
         BOTTOM_INIT_CAP = max(200, int(self.height() * 0.34))
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        splitter.addWidget(self.image_view)
-        splitter.addWidget(ctrl_scroll)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
         ctrl_widget.adjustSize()
         sb_w = self.style().pixelMetric(QtWidgets.QStyle.PM_ScrollBarExtent)
-        bottom_h = min(ctrl_widget.sizeHint().height() + sb_w + 4,
-                       BOTTOM_INIT_CAP)
-        # Send the rest to the image pane, not a hardcoded 900 that would
-        # exceed short-screen heights and force the splitter to clip.
-        top_h = max(200, self.height() - bottom_h)
-        splitter.setSizes([top_h, bottom_h])
-        splitter.setChildrenCollapsible(False)
-        # Make the divider visibly grabbable (default 1-px handle is
-        # invisible on most themes so users don't realize they can drag
-        # it). 8-px handle with a subtle hover tint = obvious affordance
-        # without dominating the layout.
-        splitter.setHandleWidth(8)
-        splitter.setStyleSheet(
-            "QSplitter::handle:vertical {"
-            " background: palette(mid); "
-            " border-top: 1px solid palette(dark);"
-            " border-bottom: 1px solid palette(dark);"
-            "}"
-            "QSplitter::handle:vertical:hover {"
-            " background: palette(highlight);"
-            "}")
-        main_layout.addWidget(splitter, stretch=1)
-        self._main_splitter = splitter
+        initial_h = min(ctrl_widget.sizeHint().height() + sb_w + 4,
+                        BOTTOM_INIT_CAP)
+        self.resizeDocks([self._controls_dock], [initial_h],
+                         QtCore.Qt.Vertical)
 
         # ── Status Bar ──
         self.status_label = QtWidgets.QLabel("Ready")
@@ -841,11 +845,19 @@ class FFViewer(QtWidgets.QMainWindow):
 
         # View menu to toggle docks
         view_menu = self.menuBar().addMenu('&View')
+        # Controls dock listed first — it's the primary panel and users may
+        # need to bring it back after accidentally closing.
+        ctrl_toggle = self._controls_dock.toggleViewAction()
+        ctrl_toggle.setText('Controls Panel')
+        ctrl_toggle.setShortcut('Ctrl+/')
+        view_menu.addAction(ctrl_toggle)
         view_menu.addAction(self.log_panel.toggleViewAction())
         view_menu.addAction(self._ivf_dock.toggleViewAction())
 
-        # Apply initial font so the viewer opens at a readable size.
-        self._on_font_changed(self.font_spin.value())
+        # Apply initial font so the viewer opens at a readable size. Prefer
+        # the QSettings-persisted value over the spinbox default (14pt) so
+        # subsequent launches respect the user's last chosen size.
+        self._on_font_changed(self._read_font_setting())
 
     def _build_toolbar(self):
         tb = QtWidgets.QHBoxLayout()
@@ -984,20 +996,18 @@ class FFViewer(QtWidgets.QMainWindow):
 
         tb.addWidget(QtWidgets.QLabel("Font:"))
         self.font_size_combo = QtWidgets.QComboBox()
-        # Editable so the user can type any point size, not just the
-        # preset list — mirrors the range the underlying spin supports.
+        # 16/18/22 added for the "give me BIG text" case. Editable so
+        # shortcuts (Ctrl+= / Ctrl+-) or manual typing can produce any value
+        # in the spinbox range without needing to hit a preset.
+        # _on_font_size_changed already tolerates unparseable text (returns
+        # early).
         self.font_size_combo.setEditable(True)
         self.font_size_combo.addItems(
             ["8", "9", "10", "11", "12", "14", "16", "18", "22"])
-        # Initial value = whatever the spin currently holds (the source of
-        # truth), or 14 as a fallback because _build_toolbar runs BEFORE
-        # image_view is constructed (line 703) so self.font_spin doesn't
-        # exist yet. 14 matches MIDASImageView._font_spin's default; the
-        # canonical size is then applied at the end of _build_ui via
-        # self._on_font_changed(self.font_spin.value()).
-        _init_font = getattr(self, 'font_spin', None)
-        _init_pt = _init_font.value() if _init_font is not None else 14
-        self.font_size_combo.setCurrentText(str(_init_pt))
+        # Initial value: prefer persisted QSettings, else DEFAULT_FONT_SIZE.
+        # Ignore Qt's app default (~9pt) — it's too small for modern laptops.
+        initial_font = self._read_font_setting()
+        self.font_size_combo.setCurrentText(str(initial_font))
         self.font_size_combo.setFixedWidth(50)
         self.font_size_combo.currentTextChanged.connect(self._on_font_size_changed)
         self.font_size_combo.setToolTip(
@@ -1013,16 +1023,7 @@ class FFViewer(QtWidgets.QMainWindow):
             size = int(size_str)
         except ValueError:
             return
-        # Write through the (hidden) font_spin so downstream readers of
-        # self.font_spin.value() stay in sync. The spin's valueChanged
-        # → image_view.fontSizeChanged → self._on_font_changed applies
-        # the actual style; single write path, no double-firing.
-        if self.font_spin.value() != size:
-            self.font_spin.setValue(size)
-        else:
-            # Combo edited to the value it already had — no signal will
-            # fire from setValue. Apply directly.
-            self._on_font_changed(size)
+        self._on_font_changed(size)
 
     def _build_file_panel(self):
         grp = QtWidgets.QGroupBox("Data Source")
@@ -1992,6 +1993,13 @@ class FFViewer(QtWidgets.QMainWindow):
         add_shortcut(self, 'A', lambda: self.axes_check.toggle())
         add_shortcut(self, 'C', self._toggle_cake_overlay)
         add_shortcut(self, 'Q', self.close)
+        # VS-Code-style font zoom. Ctrl+= and Ctrl++ both bumped because
+        # different keyboard layouts / locales generate one or the other for
+        # the same physical keypress. Ctrl+0 resets to DEFAULT_FONT_SIZE.
+        add_shortcut(self, 'Ctrl+=', lambda: self._font_step(+1))
+        add_shortcut(self, 'Ctrl++', lambda: self._font_step(+1))
+        add_shortcut(self, 'Ctrl+-', lambda: self._font_step(-1))
+        add_shortcut(self, 'Ctrl+0', lambda: self._on_font_changed(self.DEFAULT_FONT_SIZE))
 
     # ── Session Save / Load ────────────────────────────────────────
 
@@ -2815,7 +2823,49 @@ class FFViewer(QtWidgets.QMainWindow):
         self._theme = theme
         apply_theme(QtWidgets.QApplication.instance(), theme)
 
+    def _read_font_setting(self):
+        """Return the persisted font size, clamped to [FONT_MIN, FONT_MAX],
+        falling back to DEFAULT_FONT_SIZE when no setting exists (or when
+        the stored value is unparseable — e.g. corrupted QSettings)."""
+        settings = QtCore.QSettings(self._QSETTINGS_ORG, self._QSETTINGS_APP)
+        try:
+            size = int(settings.value("font_size", self.DEFAULT_FONT_SIZE))
+        except (TypeError, ValueError):
+            size = self.DEFAULT_FONT_SIZE
+        return max(self.FONT_MIN, min(self.FONT_MAX, size))
+
+    def _sync_font_widgets(self, size):
+        """Push ``size`` into both font widgets without re-firing handlers,
+        so combo, spinbox and applied font all agree after a shortcut zoom."""
+        combo = getattr(self, 'font_size_combo', None)
+        if combo is not None:
+            combo.blockSignals(True)
+            combo.setCurrentText(str(size))
+            combo.blockSignals(False)
+        spin = getattr(self, 'font_spin', None)
+        if spin is not None:
+            spin.blockSignals(True)
+            spin.setValue(size)
+            spin.blockSignals(False)
+
+    def _font_step(self, delta):
+        """Bump font by ``delta`` pt, clamped. Fires the full _on_font_changed
+        path so stylesheet + pg axes update and QSettings persists."""
+        cur = self._read_font_setting()
+        # Prefer the live combo value if present — the setting is only a
+        # fallback, and the user may have just picked a different size.
+        combo = getattr(self, 'font_size_combo', None)
+        if combo is not None:
+            try:
+                cur = int(combo.currentText())
+            except (ValueError, TypeError):
+                pass
+        new_size = max(self.FONT_MIN, min(self.FONT_MAX, cur + delta))
+        if new_size != cur:
+            self._on_font_changed(new_size)
+
     def _on_font_changed(self, size):
+        size = max(self.FONT_MIN, min(self.FONT_MAX, int(size)))
         QtWidgets.QApplication.instance().setStyleSheet(f'* {{ font-size: {size}pt; }}')
         # pyqtgraph axes ignore Qt stylesheets — update tick fonts explicitly.
         font = QtGui.QFont('', int(size))
@@ -2845,18 +2895,13 @@ class FFViewer(QtWidgets.QMainWindow):
         # pyqtgraph TextItems also don't pick up the stylesheet — redraw axes.
         if self.show_axes:
             self._draw_axes()
-        # Sync the visible font-size combo (blockSignals to avoid re-firing
-        # _on_font_size_changed, which would just no-op back to here). This
-        # covers font changes triggered by anything other than the combo:
-        # programmatic init, launcher-emitted changes, keyboard shortcuts, etc.
-        combo = getattr(self, 'font_size_combo', None)
-        if combo is not None:
-            cur = combo.currentText()
-            new = str(int(size))
-            if cur != new:
-                combo.blockSignals(True)
-                combo.setCurrentText(new)
-                combo.blockSignals(False)
+        # Sync the two font widgets (combo + spin) so both display the applied
+        # size after a shortcut zoom or a programmatic apply. blockSignals()
+        # inside _sync_font_widgets prevents re-firing this handler.
+        self._sync_font_widgets(size)
+        # Persist so next session opens at the same size.
+        settings = QtCore.QSettings(self._QSETTINGS_ORG, self._QSETTINGS_APP)
+        settings.setValue("font_size", size)
         # Notify companion launchers (Caking, BC, Data Explorer) so their
         # own Qt widget fonts and matplotlib rcParams follow.
         self.fontSizeChanged.emit(int(size))
