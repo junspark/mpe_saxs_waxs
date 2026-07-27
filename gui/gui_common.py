@@ -309,15 +309,18 @@ class MIDASImageView(QtWidgets.QWidget):
         # set_font_control_visible(False) to hide this pair — the
         # underlying spin stays as the current-font-size source of truth
         # for downstream readers, it's just not visible.
+        # NB: QToolBar.addWidget wraps its arg in a QWidgetAction; hiding
+        # via widget.setVisible(False) does NOT collapse the toolbar slot.
+        # We save the returned actions and hide via QAction.setVisible.
         self._font_label = QtWidgets.QLabel("Font:")
-        bar.addWidget(self._font_label)
+        self._font_label_action = bar.addWidget(self._font_label)
         self._font_spin = QtWidgets.QSpinBox()
         self._font_spin.setRange(8, 36)
         self._font_spin.setValue(14)
         self._font_spin.setFixedWidth(50)
         self._font_spin.setToolTip("Viewer font size (pt)")
         self._font_spin.valueChanged.connect(self.fontSizeChanged)
-        bar.addWidget(self._font_spin)
+        self._font_spin_action = bar.addWidget(self._font_spin)
 
         # ── Movie timer ──
         self._movie_timer = QtCore.QTimer(self)
@@ -333,11 +336,17 @@ class MIDASImageView(QtWidgets.QWidget):
         avoid two out-of-sync widgets showing different values. The
         underlying self._font_spin is retained regardless — downstream
         code reads .value() from it as the current-size source of truth.
+
+        Hides via the underlying QWidgetAction (bar.addWidget returns
+        this): setVisible on the raw widget doesn't collapse the toolbar
+        slot, which was the original bug.
         """
-        if hasattr(self, '_font_label'):
-            self._font_label.setVisible(visible)
-        if hasattr(self, '_font_spin'):
-            self._font_spin.setVisible(visible)
+        act_label = getattr(self, '_font_label_action', None)
+        if act_label is not None:
+            act_label.setVisible(visible)
+        act_spin = getattr(self, '_font_spin_action', None)
+        if act_spin is not None:
+            act_spin.setVisible(visible)
 
     def _set_nav_mode(self, mode):
         """Set navigation mode: 'pointer', 'pan', or 'zoom'."""
