@@ -697,6 +697,11 @@ class FFViewer(QtWidgets.QMainWindow):
         self.image_view = MIDASImageView(self, origin='bl')
         self.image_view.set_colormap(self.colormap_name)
         self.font_spin = self.image_view._font_spin
+        # Hide the MIDASImageView's built-in "Font:" pair — we expose the
+        # single canonical control on the top toolbar (self.font_size_combo).
+        # The underlying spin is kept as the current-size source of truth;
+        # downstream code (calibration panels etc.) still reads its value.
+        self.image_view.set_font_control_visible(False)
         self.image_view.fontSizeChanged.connect(self._on_font_changed)
         self.image_view.levelsChanged.connect(self._on_hist_levels_dragged)
 
@@ -942,9 +947,14 @@ class FFViewer(QtWidgets.QMainWindow):
 
         tb.addWidget(QtWidgets.QLabel("Font:"))
         self.font_size_combo = QtWidgets.QComboBox()
-        self.font_size_combo.addItems(["8", "9", "10", "11", "12", "14"])
-        app = QtWidgets.QApplication.instance()
-        self.font_size_combo.setCurrentText(str(app.font().pointSize()))
+        # Editable so the user can type any point size, not just the
+        # preset list — mirrors the range the underlying spin supports.
+        self.font_size_combo.setEditable(True)
+        self.font_size_combo.addItems(
+            ["8", "9", "10", "11", "12", "14", "16", "18", "22"])
+        # Initial value = whatever the spin currently holds (the source of
+        # truth). Keeps both widgets in agreement from launch.
+        self.font_size_combo.setCurrentText(str(self.font_spin.value()))
         self.font_size_combo.setFixedWidth(50)
         self.font_size_combo.currentTextChanged.connect(self._on_font_size_changed)
         tb.addWidget(self.font_size_combo)
@@ -956,7 +966,16 @@ class FFViewer(QtWidgets.QMainWindow):
             size = int(size_str)
         except ValueError:
             return
-        self._on_font_changed(size)
+        # Write through the (hidden) font_spin so downstream readers of
+        # self.font_spin.value() stay in sync. The spin's valueChanged
+        # → image_view.fontSizeChanged → self._on_font_changed applies
+        # the actual style; single write path, no double-firing.
+        if self.font_spin.value() != size:
+            self.font_spin.setValue(size)
+        else:
+            # Combo edited to the value it already had — no signal will
+            # fire from setValue. Apply directly.
+            self._on_font_changed(size)
 
     def _build_file_panel(self):
         grp = QtWidgets.QGroupBox("Data Source")

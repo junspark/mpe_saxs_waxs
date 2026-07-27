@@ -304,8 +304,13 @@ class MIDASImageView(QtWidgets.QWidget):
 
         bar.addSeparator()
 
-        # Font size control
-        bar.addWidget(QtWidgets.QLabel("Font:"))
+        # Font size control. Callers that expose their own font control
+        # elsewhere (e.g. FFViewer's toolbar combo) should call
+        # set_font_control_visible(False) to hide this pair — the
+        # underlying spin stays as the current-font-size source of truth
+        # for downstream readers, it's just not visible.
+        self._font_label = QtWidgets.QLabel("Font:")
+        bar.addWidget(self._font_label)
         self._font_spin = QtWidgets.QSpinBox()
         self._font_spin.setRange(8, 36)
         self._font_spin.setValue(14)
@@ -319,6 +324,20 @@ class MIDASImageView(QtWidgets.QWidget):
         self._movie_timer.timeout.connect(self._movie_tick)
 
         return bar
+
+    def set_font_control_visible(self, visible):
+        """Show / hide the 'Font:' label + spin in the playback toolbar.
+
+        Callers whose containing window already exposes a font-size control
+        elsewhere (e.g. FFViewer's top toolbar combo) should hide this to
+        avoid two out-of-sync widgets showing different values. The
+        underlying self._font_spin is retained regardless — downstream
+        code reads .value() from it as the current-size source of truth.
+        """
+        if hasattr(self, '_font_label'):
+            self._font_label.setVisible(visible)
+        if hasattr(self, '_font_spin'):
+            self._font_spin.setVisible(visible)
 
     def _set_nav_mode(self, mode):
         """Set navigation mode: 'pointer', 'pan', or 'zoom'."""
