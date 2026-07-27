@@ -989,8 +989,14 @@ class FFViewer(QtWidgets.QMainWindow):
         self.font_size_combo.addItems(
             ["8", "9", "10", "11", "12", "14", "16", "18", "22"])
         # Initial value = whatever the spin currently holds (the source of
-        # truth). Keeps both widgets in agreement from launch.
-        self.font_size_combo.setCurrentText(str(self.font_spin.value()))
+        # truth), or 14 as a fallback because _build_toolbar runs BEFORE
+        # image_view is constructed (line 703) so self.font_spin doesn't
+        # exist yet. 14 matches MIDASImageView._font_spin's default; the
+        # canonical size is then applied at the end of _build_ui via
+        # self._on_font_changed(self.font_spin.value()).
+        _init_font = getattr(self, 'font_spin', None)
+        _init_pt = _init_font.value() if _init_font is not None else 14
+        self.font_size_combo.setCurrentText(str(_init_pt))
         self.font_size_combo.setFixedWidth(50)
         self.font_size_combo.currentTextChanged.connect(self._on_font_size_changed)
         self.font_size_combo.setToolTip(
@@ -2838,6 +2844,18 @@ class FFViewer(QtWidgets.QMainWindow):
         # pyqtgraph TextItems also don't pick up the stylesheet — redraw axes.
         if self.show_axes:
             self._draw_axes()
+        # Sync the visible font-size combo (blockSignals to avoid re-firing
+        # _on_font_size_changed, which would just no-op back to here). This
+        # covers font changes triggered by anything other than the combo:
+        # programmatic init, launcher-emitted changes, keyboard shortcuts, etc.
+        combo = getattr(self, 'font_size_combo', None)
+        if combo is not None:
+            cur = combo.currentText()
+            new = str(int(size))
+            if cur != new:
+                combo.blockSignals(True)
+                combo.setCurrentText(new)
+                combo.blockSignals(False)
         # Notify companion launchers (Caking, BC, Data Explorer) so their
         # own Qt widget fonts and matplotlib rcParams follow.
         self.fontSizeChanged.emit(int(size))
