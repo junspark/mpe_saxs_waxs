@@ -811,12 +811,25 @@ def build_config(parser, args):
     """Builds a unified configuration dictionary with correct override priority."""
     # Load parameters from the file first.
     config = parse_parameter_file(args.paramFN)
+    param_dir = Path(args.paramFN).resolve().parent
+
+    def _resolve_param_relative(path_value):
+        """Resolve a possibly relative path against the parameter file directory."""
+        if not path_value:
+            return path_value
+        p = Path(str(path_value))
+        if p.is_absolute():
+            return str(p)
+        return str((param_dir / p).resolve())
 
     # Manually map the 'Dark' key from the param file to 'darkFN' for consistency.
     # The command-line argument '-darkFN' will still override this later if provided.
     if 'Dark' in config and not config.get('darkFN'):
         print(f"Info: Found 'Dark' key in parameter file: {config['Dark']}")
         config['darkFN'] = config['Dark']
+
+    if 'RawFolder' in config:
+        config['RawFolder'] = _resolve_param_relative(config['RawFolder'])
 
     # --- Dimension Mapping ---
     # Map NrPixels family to numPxY/numPxZ if they exist in the parameter file
@@ -849,6 +862,9 @@ def build_config(parser, args):
     for key, value in vars(args).items():
         if key not in config or value != parser.get_default(key):
             config[key] = value
+
+    if config.get('darkFN') and args.darkFN == parser.get_default('darkFN'):
+        config['darkFN'] = _resolve_param_relative(config['darkFN'])
 
     # Handle special dataFN construction logic
     if not args.dataFN or config.get('LayerNr', 1) > 1:
