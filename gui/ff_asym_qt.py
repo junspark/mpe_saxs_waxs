@@ -1143,7 +1143,7 @@ class FFViewer(QtWidgets.QMainWindow):
         lay.addWidget(btn_zip, 0, 3)
 
         self.dark_label = QtWidgets.QLabel("")
-        self.dark_label.setStyleSheet("color: gray; font-size: 9pt;")
+        self.dark_label.setStyleSheet("color: gray;")
         lay.addWidget(self.dark_label, 0, 4)
 
         lbl_fnr = QtWidgets.QLabel("File Nr")
@@ -1286,7 +1286,7 @@ class FFViewer(QtWidgets.QMainWindow):
         self.single_cake_label.setStyleSheet("color: gray;")
         cl.addWidget(self.single_cake_label, 0, 3, 1, 7)
 
-        _hs = "color: gray; font-size: 9pt;"
+        _hs = "color: gray;"
         column_labels = ["R min", "R max", "R step",
                          "η min", "η max", "η step",
                          "ω ave", "ω start", "ω step"]
@@ -1380,7 +1380,7 @@ class FFViewer(QtWidgets.QMainWindow):
         self.cake_label.setStyleSheet("color: gray;")
         cl.addWidget(self.cake_label, 0, 3, 1, 4)
 
-        _hs = "color: gray; font-size: 9pt;"
+        _hs = "color: gray;"
         column_labels = ["R min", "R max", "R step",
                          "η min", "η max", "η step",
                          "ω ave", "ω start", "ω step"]
@@ -1608,7 +1608,7 @@ class FFViewer(QtWidgets.QMainWindow):
             "buttons (Arc-fit BC/Lsd, Calibrate, Calibrate v2) and the "
             "on-image ring overlays.")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #666; font-size: 9pt;")
+        hint.setStyleSheet("color: #666;")
         lay.addWidget(hint)
 
         lay.addStretch(1)
