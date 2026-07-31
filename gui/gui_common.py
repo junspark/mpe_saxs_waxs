@@ -150,8 +150,27 @@ class MIDASImageView(QtWidgets.QWidget):
         # right edge. Callers with their own intensity controls (FF viewer's
         # Min I / Max I edits + Cmap combo in the top toolbar) don't need
         # it and it steals ~4% of horizontal space on wide-detector views.
+        # Just .hide() leaves the layout column reserved; also collapse the
+        # column widths and remove the widget from the layout so the
+        # GraphicsView expands to fill.
         if not show_histogram:
-            self._iv.ui.histogram.hide()
+            try:
+                hist = self._iv.ui.histogram
+                grid = self._iv.ui.gridLayout
+                grid.removeWidget(hist)
+                hist.setParent(None)
+                hist.hide()
+                # roiBtn (col 1) and menuBtn (col 2) are already hidden;
+                # zero their columns so the GraphicsView (col 0) takes the
+                # full row width. Without this pyqtgraph reserves ~40 px
+                # for the LUT strip regardless of visibility.
+                grid.setColumnStretch(0, 1)
+                grid.setColumnStretch(1, 0)
+                grid.setColumnStretch(2, 0)
+                grid.setColumnMinimumWidth(1, 0)
+                grid.setColumnMinimumWidth(2, 0)
+            except (AttributeError, RuntimeError):
+                pass
 
         # Force the histogram axis to integer tick labels. Diffraction
         # intensities are always counts; the default '%.2g' formatter
