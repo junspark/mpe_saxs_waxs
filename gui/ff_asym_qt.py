@@ -1808,29 +1808,36 @@ class FFViewer(QtWidgets.QMainWindow):
         }
 
     def _build_processing_panel(self):
+        """Build the Detector & Rings tab as a 3-column layout.
+
+        Column 1 (actions): all action buttons stacked vertically
+          (Arc-fit BC/Lsd, Load params, Instr. only, Zero tilts,
+          Calibrate, Calibrate v2, Save params).
+        Column 2 (geometry): Lsd, BC_Y, BC_Z, Tx, Ty, Tz — each with
+          label|edit|refine|tol.
+        Column 3 (distortion + Energy): p0, p1, p2, p3, Energy — same
+          label|edit|refine|tol form.
+
+        Puts buttons in their own column instead of a bottom action
+        row → panel height is bounded by max(actions_col_rows,
+        params_col_rows) ≈ 7 instead of 8+, and buttons don't force
+        horizontal scrolling on narrow docks."""
         grp = QtWidgets.QGroupBox("Detector & Rings")
-        lay = QtWidgets.QGridLayout(grp)
-        lay.setContentsMargins(6, 4, 6, 4)
-        lay.setVerticalSpacing(2)
-        lay.setHorizontalSpacing(4)
-        # Two symmetric halves side by side (label|edit|refine|tol each),
-        # with a spacer column between them. Halves the vertical footprint
-        # so all 10 params + Energy fit without scrolling on typical dock
-        # heights.
-        #   Left half : cols 0..3
-        #   Spacer    : col 4  (stretches to eat leftover width)
-        #   Right half: cols 5..8
-        for c in (4,):
-            lay.setColumnStretch(c, 1)
+        outer = QtWidgets.QHBoxLayout(grp)
+        outer.setContentsMargins(6, 4, 6, 4)
+        outer.setSpacing(14)
 
         # Registries so _launch_calibration can look up each param's
         # flag/tol without hardcoding widget names.
         self._refine_checks: dict = {}
         self._refine_tols: dict = {}
 
-        # Rings Material button lives in its own "Rings" tab now
-        # (see _build_rings_panel). Arc-fit stays here because it
-        # writes BC/Lsd directly into the geometry fields below.
+        # ═══ Column 1: actions ═══
+        actions = QtWidgets.QVBoxLayout()
+        actions.setSpacing(4)
+
+        # Arc-fit BC/Lsd — interactive picker; writes BC/Lsd directly
+        # into the geometry fields.
         btn_arcfit = QtWidgets.QPushButton("Arc-fit BC/Lsd…")
         btn_arcfit.setToolTip(
             "Click 5+ points on visible ring arcs to derive a sub-pixel BC "
@@ -1838,187 +1845,25 @@ class FFViewer(QtWidgets.QMainWindow):
             "beam is off-detector or arcs are heavily occluded. Requires "
             "midas-calibrate-v2.")
         btn_arcfit.clicked.connect(self._open_arc_fit_dialog)
-        lay.addWidget(btn_arcfit, 0, 0, 1, 2)
-        # Column headers — one set per half.
-        def _add_header(text, col):
-            lbl = QtWidgets.QLabel(text)
-            lbl.setStyleSheet("color: #555;")
-            lbl.setAlignment(QtCore.Qt.AlignCenter)
-            lay.addWidget(lbl, 0, col)
-        _add_header("Refine?", 2)
-        _add_header("± margin", 3)
-        _add_header("Refine?", 7)
-        _add_header("± margin", 8)
+        actions.addWidget(btn_arcfit)
 
-        def _add_refine(row: int, name: str, tol_default: float,
-                        tip: str = '', col_offset: int = 0):
-            """Add the Refine checkbox + tolerance edit for the parameter
-            on ``row`` and register it under ``name``. ``col_offset`` = 0
-            puts the pair at cols (2, 3); ``col_offset`` = 5 puts it at
-            cols (7, 8) — the right-hand half."""
-            refine_col = 2 + col_offset
-            tol_col = 3 + col_offset
-            cb = QtWidgets.QCheckBox()
-            cb.setToolTip('Include this parameter in MIDAS calibration '
-                          'refinement.\n' + tip)
-            lay.addWidget(cb, row, refine_col,
-                          alignment=QtCore.Qt.AlignCenter)
-            self._refine_checks[name] = cb
-            tol = QtWidgets.QLineEdit(f'{tol_default:g}')
-            tol.setFixedWidth(70)
-            tol.setToolTip('Maximum ± change allowed during refinement.\n'
-                           'Also used as MIDAS tolX (0 → parameter locked).\n'
-                           + tip)
-            lay.addWidget(tol, row, tol_col)
-            self._refine_tols[name] = tol
-            # Grey the tol edit when refine is unchecked so the two
-            # controls read as one intent (matches [[feedback-disable-vs-hide]]).
-            def _sync(): tol.setEnabled(cb.isChecked())
-            cb.toggled.connect(_sync)
-            _sync()
-
-        lay.addWidget(QtWidgets.QLabel("Lsd (μm)"), 1, 0)
-        self.lsd_edit = QtWidgets.QLineEdit(str(self.lsd_local))
-        self.lsd_edit.setMinimumWidth(100)
-        self.lsd_edit.setToolTip(
-            "Sample-to-detector distance in micrometres. Rings redraw on "
-            "edit — nudge until overlays sit on calibrant peaks. Typical: "
-            "300000–2000000 (30 cm to 2 m).")
-        lay.addWidget(self.lsd_edit, 1, 1)
-        _add_refine(1, 'Lsd', 25000,
-                    'Sample-to-detector distance (µm). MIDAS default '
-                    'tolerance is 25000.')
-
-        lay.addWidget(QtWidgets.QLabel("Beam Ctr Y"), 2, 0)
-        self.bcy_edit = QtWidgets.QLineEdit(str(self.bc_local[0]))
-        self.bcy_edit.setMinimumWidth(90)
-        self.bcy_edit.setToolTip(
-            "Beam center Y coordinate in pixels (horizontal). Can be "
-            "negative or > NrPixels when the beam is off-detector.")
-        lay.addWidget(self.bcy_edit, 2, 1)
-        _add_refine(2, 'BC_Y', 20,
-                    'Beam center Y (pixels). MIDAS refines BC_Y/BC_Z '
-                    'as a family via tolBC (default 20).')
-
-        lay.addWidget(QtWidgets.QLabel("Beam Ctr Z"), 3, 0)
-        self.bcz_edit = QtWidgets.QLineEdit(str(self.bc_local[1]))
-        self.bcz_edit.setMinimumWidth(90)
-        self.bcz_edit.setToolTip(
-            "Beam center Z coordinate in pixels (vertical). Detector origin "
-            "is bottom-left in the viewer.")
-        lay.addWidget(self.bcz_edit, 3, 1)
-        _add_refine(3, 'BC_Z', 20,
-                    'Beam center Z (pixels). BC_Y/BC_Z refine as a '
-                    'family — check either to enable both.')
-
-        _tilt_family_tip = (
-            'Tx / Ty / Tz refine as a family in MIDAS (single tolTilts '
-            'key). Checking any tilt enables refinement of all three '
-            'with tolTilts = max of the checked tolerances.')
-
-        lay.addWidget(QtWidgets.QLabel("Tx (deg)"), 4, 0)
-        self.tx_edit = QtWidgets.QLineEdit(str(self.tx_local))
-        self.tx_edit.setMinimumWidth(90)
-        self.tx_edit.setToolTip(
-            "Detector tilt about beam axis (deg).\n"
-            "Image is rotated around (Beam Ctr Y, Beam Ctr Z) by -Tx to undo the tilt.\n"
-            "Cursor R/η are reported in the corrected frame.")
-        lay.addWidget(self.tx_edit, 4, 1)
-        _add_refine(4, 'Tx', 3, _tilt_family_tip)
-
-        lay.addWidget(QtWidgets.QLabel("Ty (deg)"), 5, 0)
-        self.ty_edit = QtWidgets.QLineEdit(str(self.ty_local))
-        self.ty_edit.setMinimumWidth(90)
-        self.ty_edit.setToolTip(
-            "Detector tilt about lab +Y (deg).\n"
-            "Stored for round-tripping to the MIDAS param file; the viewer\n"
-            "displays raw pixels — Ty is applied by downstream integrators\n"
-            "(AutoCalibrateZarr, integrator.py) using the refined value.")
-        lay.addWidget(self.ty_edit, 5, 1)
-        _add_refine(5, 'Ty', 3, _tilt_family_tip)
-
-        lay.addWidget(QtWidgets.QLabel("Tz (deg)"), 6, 0)
-        self.tz_edit = QtWidgets.QLineEdit(str(self.tz_local))
-        self.tz_edit.setMinimumWidth(90)
-        self.tz_edit.setToolTip(
-            "Detector tilt about lab +Z (deg).\n"
-            "Stored for round-tripping to the MIDAS param file; the viewer\n"
-            "displays raw pixels — Tz is applied by downstream integrators\n"
-            "(AutoCalibrateZarr, integrator.py) using the refined value.")
-        lay.addWidget(self.tz_edit, 6, 1)
-        _add_refine(6, 'Tz', 3, _tilt_family_tip)
-
-        # ── MIDAS radial-distortion params (p0/p1/p2/p3) ──
-        # DistortFunc = 1 + p0·R̂²·cos(2·EtaT + p6)
-        #                 + p1·R̂⁴·cos(4·EtaT + p3)
-        #                 + p2·R̂²
-        # where R̂ = R/RhoD (RhoD = MaxRingRad from the param file).
-        # Rings redraw live so users can visually match rings to peaks.
-        #
-        # Placed on the RIGHT half (cols 5..8) starting at row 1 so the
-        # panel's total height is bounded by the taller of the two
-        # halves (geometry = 6 rows, distortion+energy = 5 rows). Halves
-        # the vertical footprint vs the pre-two-column layout.
-        self._distortion_tooltip = (
-            "MIDAS radial-distortion coefficient.\n"
-            "DistortFunc = 1 + p0·R̂²·cos(2·EtaT+p6) + p1·R̂⁴·cos(4·EtaT+p3) + p2·R̂²\n"
-            "(R̂ = R / MaxRingRad). Live redraw — set to 0 for undistorted rings.")
-        for row, (name, attr, tol_def) in enumerate((
-                ('p0', 'p0_edit', 2e-3), ('p1', 'p1_edit', 2e-3),
-                ('p2', 'p2_edit', 2e-3), ('p3 (deg)', 'p3_edit', 45.0))):
-            r = 1 + row   # place on right half starting from row 1
-            lay.addWidget(QtWidgets.QLabel(name), r, 5)
-            key = name.split()[0]   # 'p0', 'p1', 'p2', 'p3'
-            local = getattr(self, f'{key}_local')
-            ed = QtWidgets.QLineEdit(str(local))
-            ed.setMinimumWidth(90)
-            ed.setToolTip(self._distortion_tooltip)
-            lay.addWidget(ed, r, 6)
-            setattr(self, attr, ed)
-            _add_refine(r, key, tol_def,
-                        f'Distortion coefficient {key}. Written to ps.txt '
-                        f'as tol{key.upper() if key != "p0" else "P"} '
-                        f'during refinement (0 → locked).',
-                        col_offset=5)
-
-        # Energy (keV). Live-editable — changing it re-scales the cached
-        # ring radii via Bragg's law (rescaled by the new wavelength).
-        # Kept in sync with self.wl (which is stored in Å). Placed on the
-        # right half, row 5 (below the four p-coefficients).
-        lay.addWidget(QtWidgets.QLabel("Energy (keV)"), 5, 5)
-        self.energy_edit = QtWidgets.QLineEdit(
-            f'{12.398 / self.wl:.4f}' if self.wl else '')
-        self.energy_edit.setMinimumWidth(90)
-        self.energy_edit.setToolTip(
-            "Beam energy in keV (λ [Å] = 12.398 / E).\n"
-            "Editing this rescales existing ring radii via Bragg's law "
-            "using each ring's cached d-spacing — no need to re-run "
-            "Rings Material after an energy change.")
-        lay.addWidget(self.energy_edit, 5, 6)
-
-        # Calibrate / Save row. Calibrate launches MIDAS refinement using
-        # the checked parameters + tolerances; Save writes the current
-        # geometry (as edited on this panel) into a MIDAS-style ps.txt
-        # that can be reloaded here or fed to the caking launcher.
-        # Param I/O + Calibrate cluster. Load / Instr-only sit here
-        # (relocated from the Data Source panel) so all
-        # parameter-file-related controls live in one row.
-        action_row = QtWidgets.QHBoxLayout()
+        # Param file I/O + refinement launchers.
         load_btn = QtWidgets.QPushButton("Load params…")
         load_btn.setToolTip(
             "Load a MIDAS-style parameter file (ps.txt / Parameters.txt).\n"
             "Populates detector geometry, transforms, crystallography, "
             "and file layout fields, then redraws.")
         load_btn.clicked.connect(self._on_load_param_file)
-        action_row.addWidget(load_btn)
+        actions.addWidget(load_btn)
+
         self.instr_only_check = QtWidgets.QCheckBox("Instr. only")
         self.instr_only_check.setToolTip(
             "When checked, loading a param file applies only instrument/geometry\n"
             "parameters (LSD, BC, pixel size, wavelength, space group, etc.).\n"
             "All file/path fields are ignored: Folder, FileStem, StartNr, Ext,\n"
             "dataLoc/darkLoc (HDF5 paths), and DarkStem/Dark.")
-        action_row.addWidget(self.instr_only_check)
-        action_row.addSpacing(12)
+        actions.addWidget(self.instr_only_check)
+
         self.zero_tilts_btn = QtWidgets.QPushButton("Zero tilts")
         self.zero_tilts_btn.setToolTip(
             "Reset Tx/Ty/Tz to 0 and uncheck their refine flags. Use when a\n"
@@ -2026,15 +1871,23 @@ class FFViewer(QtWidgets.QMainWindow):
             "(e.g. Tz ≈ 13°) — clears the bad seed so the next refinement\n"
             "starts from a clean geometry with only Lsd + BC free.")
         self.zero_tilts_btn.clicked.connect(self._zero_tilts)
-        action_row.addWidget(self.zero_tilts_btn)
-        action_row.addSpacing(12)
+        actions.addWidget(self.zero_tilts_btn)
+
+        # Small separator before the refinement launchers so they cluster
+        # visually as the "run the fit" group.
+        sep_line = QtWidgets.QFrame()
+        sep_line.setFrameShape(QtWidgets.QFrame.HLine)
+        sep_line.setFrameShadow(QtWidgets.QFrame.Sunken)
+        actions.addWidget(sep_line)
+
         self.calibrate_btn = QtWidgets.QPushButton("Calibrate…")
         self.calibrate_btn.setToolTip(
             "Refine every checked parameter within its ± margin using MIDAS.\n"
             "Requires a loaded image and at least one ring generated via "
             "Rings Material.")
         self.calibrate_btn.clicked.connect(self._launch_calibration)
-        action_row.addWidget(self.calibrate_btn)
+        actions.addWidget(self.calibrate_btn)
+
         self.calibrate_v2_btn = QtWidgets.QPushButton("Calibrate (v2)…")
         self.calibrate_v2_btn.setToolTip(
             "Refine every checked parameter with midas-calibrate-v2\n"
@@ -2043,7 +1896,8 @@ class FFViewer(QtWidgets.QMainWindow):
             "seed, same Refine? / ± margin controls. Requires\n"
             "midas-calibrate-v2 installed in the runtime env.")
         self.calibrate_v2_btn.clicked.connect(self._launch_calibration_v2)
-        action_row.addWidget(self.calibrate_v2_btn)
+        actions.addWidget(self.calibrate_v2_btn)
+
         self.save_params_btn = QtWidgets.QPushButton("Save params…")
         self.save_params_btn.setToolTip(
             "Write the current detector geometry (Lsd, BC, tilts, "
@@ -2051,14 +1905,173 @@ class FFViewer(QtWidgets.QMainWindow):
             "The written file is compatible with the viewer's load-params "
             "flow and with downstream MIDAS tools.")
         self.save_params_btn.clicked.connect(self._save_params_to_file)
-        action_row.addWidget(self.save_params_btn)
-        # Action row lives below both parameter halves — geometry (left,
-        # rows 1..6) and distortion+energy (right, rows 1..5). Spans all
-        # 9 columns of the two-half grid.
-        lay.addLayout(action_row, 7, 0, 1, 9)
+        actions.addWidget(self.save_params_btn)
 
-        # See _build_image_display_panel: same trick to keep rows packed at top.
-        lay.setRowStretch(8, 1)
+        actions.addStretch(1)  # push controls to the top of the column
+        outer.addLayout(actions)
+
+        # ═══ Column 2: geometry params ═══
+        # QGridLayout with 4 sub-columns: label | edit | refine | tol.
+        geom = QtWidgets.QGridLayout()
+        geom.setVerticalSpacing(2)
+        geom.setHorizontalSpacing(4)
+
+        # ═══ Column 3: distortion + Energy ═══
+        dist = QtWidgets.QGridLayout()
+        dist.setVerticalSpacing(2)
+        dist.setHorizontalSpacing(4)
+
+        # Column headers over the refinement controls, one set per grid.
+        def _add_header(target_grid, text, col):
+            lbl = QtWidgets.QLabel(text)
+            lbl.setStyleSheet("color: #555;")
+            lbl.setAlignment(QtCore.Qt.AlignCenter)
+            target_grid.addWidget(lbl, 0, col)
+        _add_header(geom, "Refine?", 2)
+        _add_header(geom, "± margin", 3)
+        _add_header(dist, "Refine?", 2)
+        _add_header(dist, "± margin", 3)
+
+        def _add_refine(target_grid, row: int, name: str, tol_default: float,
+                        tip: str = ''):
+            """Add the Refine checkbox (col 2) + tolerance edit (col 3)
+            for the parameter on ``row`` of ``target_grid`` and register
+            it under ``name``."""
+            cb = QtWidgets.QCheckBox()
+            cb.setToolTip('Include this parameter in MIDAS calibration '
+                          'refinement.\n' + tip)
+            target_grid.addWidget(cb, row, 2, alignment=QtCore.Qt.AlignCenter)
+            self._refine_checks[name] = cb
+            tol = QtWidgets.QLineEdit(f'{tol_default:g}')
+            tol.setFixedWidth(70)
+            tol.setToolTip('Maximum ± change allowed during refinement.\n'
+                           'Also used as MIDAS tolX (0 → parameter locked).\n'
+                           + tip)
+            target_grid.addWidget(tol, row, 3)
+            self._refine_tols[name] = tol
+            # Grey the tol edit when refine is unchecked so the two
+            # controls read as one intent (matches [[feedback-disable-vs-hide]]).
+            def _sync(): tol.setEnabled(cb.isChecked())
+            cb.toggled.connect(_sync)
+            _sync()
+
+        # ── Geometry column entries ──
+        geom.addWidget(QtWidgets.QLabel("Lsd (μm)"), 1, 0)
+        self.lsd_edit = QtWidgets.QLineEdit(str(self.lsd_local))
+        self.lsd_edit.setMinimumWidth(100)
+        self.lsd_edit.setToolTip(
+            "Sample-to-detector distance in micrometres. Rings redraw on "
+            "edit — nudge until overlays sit on calibrant peaks. Typical: "
+            "300000–2000000 (30 cm to 2 m).")
+        geom.addWidget(self.lsd_edit, 1, 1)
+        _add_refine(geom, 1, 'Lsd', 25000,
+                    'Sample-to-detector distance (µm). MIDAS default '
+                    'tolerance is 25000.')
+
+        geom.addWidget(QtWidgets.QLabel("Beam Ctr Y"), 2, 0)
+        self.bcy_edit = QtWidgets.QLineEdit(str(self.bc_local[0]))
+        self.bcy_edit.setMinimumWidth(90)
+        self.bcy_edit.setToolTip(
+            "Beam center Y coordinate in pixels (horizontal). Can be "
+            "negative or > NrPixels when the beam is off-detector.")
+        geom.addWidget(self.bcy_edit, 2, 1)
+        _add_refine(geom, 2, 'BC_Y', 20,
+                    'Beam center Y (pixels). MIDAS refines BC_Y/BC_Z '
+                    'as a family via tolBC (default 20).')
+
+        geom.addWidget(QtWidgets.QLabel("Beam Ctr Z"), 3, 0)
+        self.bcz_edit = QtWidgets.QLineEdit(str(self.bc_local[1]))
+        self.bcz_edit.setMinimumWidth(90)
+        self.bcz_edit.setToolTip(
+            "Beam center Z coordinate in pixels (vertical). Detector origin "
+            "is bottom-left in the viewer.")
+        geom.addWidget(self.bcz_edit, 3, 1)
+        _add_refine(geom, 3, 'BC_Z', 20,
+                    'Beam center Z (pixels). BC_Y/BC_Z refine as a '
+                    'family — check either to enable both.')
+
+        _tilt_family_tip = (
+            'Tx / Ty / Tz refine as a family in MIDAS (single tolTilts '
+            'key). Checking any tilt enables refinement of all three '
+            'with tolTilts = max of the checked tolerances.')
+
+        geom.addWidget(QtWidgets.QLabel("Tx (deg)"), 4, 0)
+        self.tx_edit = QtWidgets.QLineEdit(str(self.tx_local))
+        self.tx_edit.setMinimumWidth(90)
+        self.tx_edit.setToolTip(
+            "Detector tilt about beam axis (deg).\n"
+            "Image is rotated around (Beam Ctr Y, Beam Ctr Z) by -Tx to undo the tilt.\n"
+            "Cursor R/η are reported in the corrected frame.")
+        geom.addWidget(self.tx_edit, 4, 1)
+        _add_refine(geom, 4, 'Tx', 3, _tilt_family_tip)
+
+        geom.addWidget(QtWidgets.QLabel("Ty (deg)"), 5, 0)
+        self.ty_edit = QtWidgets.QLineEdit(str(self.ty_local))
+        self.ty_edit.setMinimumWidth(90)
+        self.ty_edit.setToolTip(
+            "Detector tilt about lab +Y (deg).\n"
+            "Stored for round-tripping to the MIDAS param file; the viewer\n"
+            "displays raw pixels — Ty is applied by downstream integrators\n"
+            "(AutoCalibrateZarr, integrator.py) using the refined value.")
+        geom.addWidget(self.ty_edit, 5, 1)
+        _add_refine(geom, 5, 'Ty', 3, _tilt_family_tip)
+
+        geom.addWidget(QtWidgets.QLabel("Tz (deg)"), 6, 0)
+        self.tz_edit = QtWidgets.QLineEdit(str(self.tz_local))
+        self.tz_edit.setMinimumWidth(90)
+        self.tz_edit.setToolTip(
+            "Detector tilt about lab +Z (deg).\n"
+            "Stored for round-tripping to the MIDAS param file; the viewer\n"
+            "displays raw pixels — Tz is applied by downstream integrators\n"
+            "(AutoCalibrateZarr, integrator.py) using the refined value.")
+        geom.addWidget(self.tz_edit, 6, 1)
+        _add_refine(geom, 6, 'Tz', 3, _tilt_family_tip)
+
+        outer.addLayout(geom)
+
+        # ── Distortion + Energy column entries ──
+        # DistortFunc = 1 + p0·R̂²·cos(2·EtaT + p6)
+        #                 + p1·R̂⁴·cos(4·EtaT + p3)
+        #                 + p2·R̂²
+        # where R̂ = R/RhoD (RhoD = MaxRingRad from the param file).
+        # Rings redraw live so users can visually match rings to peaks.
+        self._distortion_tooltip = (
+            "MIDAS radial-distortion coefficient.\n"
+            "DistortFunc = 1 + p0·R̂²·cos(2·EtaT+p6) + p1·R̂⁴·cos(4·EtaT+p3) + p2·R̂²\n"
+            "(R̂ = R / MaxRingRad). Live redraw — set to 0 for undistorted rings.")
+        for row, (label, attr, tol_def) in enumerate((
+                ('p0', 'p0_edit', 2e-3), ('p1', 'p1_edit', 2e-3),
+                ('p2', 'p2_edit', 2e-3), ('p3 (deg)', 'p3_edit', 45.0))):
+            r = 1 + row
+            dist.addWidget(QtWidgets.QLabel(label), r, 0)
+            key = label.split()[0]   # 'p0', 'p1', 'p2', 'p3'
+            local = getattr(self, f'{key}_local')
+            ed = QtWidgets.QLineEdit(str(local))
+            ed.setMinimumWidth(90)
+            ed.setToolTip(self._distortion_tooltip)
+            dist.addWidget(ed, r, 1)
+            setattr(self, attr, ed)
+            _add_refine(dist, r, key, tol_def,
+                        f'Distortion coefficient {key}. Written to ps.txt '
+                        f'as tol{key.upper() if key != "p0" else "P"} '
+                        f'during refinement (0 → locked).')
+
+        # Energy (keV). Live-editable — changing it re-scales the cached
+        # ring radii via Bragg's law (rescaled by the new wavelength).
+        # Kept in sync with self.wl (which is stored in Å).
+        dist.addWidget(QtWidgets.QLabel("Energy (keV)"), 5, 0)
+        self.energy_edit = QtWidgets.QLineEdit(
+            f'{12.398 / self.wl:.4f}' if self.wl else '')
+        self.energy_edit.setMinimumWidth(90)
+        self.energy_edit.setToolTip(
+            "Beam energy in keV (λ [Å] = 12.398 / E).\n"
+            "Editing this rescales existing ring radii via Bragg's law "
+            "using each ring's cached d-spacing — no need to re-run "
+            "Rings Material after an energy change.")
+        dist.addWidget(self.energy_edit, 5, 1)
+
+        outer.addLayout(dist)
+        outer.addStretch(1)   # trailing stretch soaks up extra horizontal width
 
         return grp
 
