@@ -134,7 +134,8 @@ class MIDASImageView(QtWidgets.QWidget):
     # so consumers can populate text fields without unit conversion.
     levelsChanged = QtCore.pyqtSignal(float, float)
 
-    def __init__(self, parent=None, name='MIDASImageView', origin='bl', **kwargs):
+    def __init__(self, parent=None, name='MIDASImageView', origin='bl',
+                 show_histogram=True, **kwargs):
         super().__init__(parent)
 
         self._raw_data = None
@@ -145,6 +146,12 @@ class MIDASImageView(QtWidgets.QWidget):
         self._iv = pg.ImageView(parent=self, name=name, view=pg.PlotItem(), **kwargs)
         self._iv.ui.roiBtn.hide()
         self._iv.ui.menuBtn.hide()
+        # Optional: hide pyqtgraph's built-in histogram/LUT strip on the
+        # right edge. Callers with their own intensity controls (FF viewer's
+        # Min I / Max I edits + Cmap combo in the top toolbar) don't need
+        # it and it steals ~4% of horizontal space on wide-detector views.
+        if not show_histogram:
+            self._iv.ui.histogram.hide()
 
         # Force the histogram axis to integer tick labels. Diffraction
         # intensities are always counts; the default '%.2g' formatter
