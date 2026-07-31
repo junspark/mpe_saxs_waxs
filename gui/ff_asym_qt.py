@@ -1814,7 +1814,11 @@ class FFViewer(QtWidgets.QMainWindow):
         row → panel height is bounded by max(actions_col_rows,
         params_col_rows) ≈ 7 instead of 8+, and buttons don't force
         horizontal scrolling on narrow docks."""
-        grp = QtWidgets.QGroupBox("Detector & Rings")
+        # No title on the group box — the tab name ("Calibration") and the
+        # dedicated Rings tab already carry the context. The old
+        # "Detector & Rings" title predates the tab split and now reads as
+        # duplicate signage.
+        grp = QtWidgets.QGroupBox()
         outer = QtWidgets.QHBoxLayout(grp)
         outer.setContentsMargins(6, 4, 6, 4)
         outer.setSpacing(14)
@@ -4193,6 +4197,27 @@ class FFViewer(QtWidgets.QMainWindow):
         ((3232, 512),   62.0, 'Pixirad-8 CdTe (linear array)'),
         ((512, 3232),   62.0, 'Pixirad-8 CdTe (transposed)'),
     )
+
+    def _default_max_ring_rad_um(self) -> float:
+        """Max ring radius (µm) covered by the current detector geometry.
+
+        Distance from BC to the farthest ON-detector corner, in µm. When
+        BC is off-detector (asymmetric FF-HEDM), the farthest corner is
+        still one of the four physical corners — we take max(|BC|, |N-BC|)
+        on each axis. Used by RingSelectionDialog as a smart default so
+        we don't generate hundreds of rings beyond the detector's reach.
+        Returns 0.0 if geometry isn't populated yet."""
+        try:
+            px = float(self.pixel_size)
+            ny = int(self.ny); nz = int(self.nz)
+            bcy = float(self.bc_local[0]); bcz = float(self.bc_local[1])
+        except (TypeError, ValueError, AttributeError, IndexError):
+            return 0.0
+        if px <= 0 or ny <= 0 or nz <= 0:
+            return 0.0
+        dy = max(abs(bcy), abs(ny - bcy))
+        dz = max(abs(bcz), abs(nz - bcz))
+        return math.sqrt(dy * dy + dz * dz) * px
 
     # Shapes whose NX pixel_size metadata is known to be wrong at APS —
     # trust the shape preset instead. Everything else follows the historical
@@ -7647,7 +7672,21 @@ class RingSelectionDialog(QtWidgets.QDialog):
 
         self.sg_edit = QtWidgets.QLineEdit(str(self.viewer.sg))
         self.lsd_edit = QtWidgets.QLineEdit(str(self.viewer.lsd_local))
-        self.maxrad_edit = QtWidgets.QLineEdit(str(self.viewer.temp_max_ring_rad))
+        # Default MaxRingRad to the detector's actual reach. Rings beyond
+        # this can't be observed anyway. Respect a smaller user/param-file
+        # value; override anything larger (typically the stale 2 m default).
+        detector_cap = self.viewer._default_max_ring_rad_um()
+        current = float(self.viewer.temp_max_ring_rad or 0.0)
+        if detector_cap > 0 and (current <= 0 or current > detector_cap):
+            prefill = detector_cap
+        else:
+            prefill = current if current > 0 else (detector_cap or 2000000.0)
+        self.maxrad_edit = QtWidgets.QLineEdit(f'{prefill:g}')
+        self.maxrad_edit.setToolTip(
+            "Rings beyond this radius (µm) are dropped during Generate.\n"
+            f"Detector-limited default: {detector_cap:g} µm — the distance "
+            "from the current BC to the farthest detector corner.\n"
+            "Bump up manually if you need overflow rings (e.g. for RhoD).")
         self.lc_edits = []
         for i in range(6):
             e = QtWidgets.QLineEdit(str(self.viewer.lattice_const[i]))
