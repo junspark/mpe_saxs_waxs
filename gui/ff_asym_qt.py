@@ -841,35 +841,31 @@ class FFViewer(QtWidgets.QMainWindow):
         # dragging the tab bar with it.
         ctrl_widget.setMinimumHeight(80)
 
-        # Image now goes directly into main_layout. Controls live in a
-        # detachable QDockWidget (BottomDockWidgetArea by default) so users
-        # on laptop screens — where the fixed horizontal bottom strip was
-        # chopped and required horizontal scrolling — can drag it off to
-        # float as a free window, dock it at another edge, hide it, or
-        # resize by grabbing the dock's top edge. Toggle via View menu.
-        main_layout.addWidget(self.image_view, stretch=1)
+        # Image + Controls stacked vertically in a QSplitter so the user
+        # can drag the split ratio but the controls stay fixed in the
+        # main window. The previous QDockWidget-based approach allowed
+        # detach/float/close — removed per user request as it was more
+        # complexity than value.
+        self._controls_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self._controls_splitter.setChildrenCollapsible(False)
+        self._controls_splitter.addWidget(self.image_view)
+        self._controls_splitter.addWidget(ctrl_widget)
+        # Image gets all the stretch; controls sit at their sizeHint.
+        self._controls_splitter.setStretchFactor(0, 1)
+        self._controls_splitter.setStretchFactor(1, 0)
+        main_layout.addWidget(self._controls_splitter, stretch=1)
 
-        self._controls_dock = QtWidgets.QDockWidget("Controls", self)
-        self._controls_dock.setObjectName("ff_controls_dock")
-        self._controls_dock.setWidget(ctrl_widget)
-        self._controls_dock.setFeatures(
-            QtWidgets.QDockWidget.DockWidgetMovable |
-            QtWidgets.QDockWidget.DockWidgetFloatable |
-            QtWidgets.QDockWidget.DockWidgetClosable)
-        self._controls_dock.setAllowedAreas(QtCore.Qt.AllDockWidgetAreas)
-        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self._controls_dock)
-
-        # Cap the initial dock height at ~1/3 of the window (proportional
+        # Cap initial controls height at ~1/3 of the window (proportional
         # so laptop screens don't lose the image to a tall controls block);
         # floor at 200 px so multi-detector rows aren't hidden on first
         # launch. Mirrors the pre-refactor BOTTOM_INIT_CAP splitter logic.
         BOTTOM_INIT_CAP = max(200, int(self.height() * 0.34))
         ctrl_widget.adjustSize()
         sb_w = self.style().pixelMetric(QtWidgets.QStyle.PM_ScrollBarExtent)
-        initial_h = min(ctrl_widget.sizeHint().height() + sb_w + 4,
-                        BOTTOM_INIT_CAP)
-        self.resizeDocks([self._controls_dock], [initial_h],
-                         QtCore.Qt.Vertical)
+        initial_ctrl_h = min(ctrl_widget.sizeHint().height() + sb_w + 4,
+                             BOTTOM_INIT_CAP)
+        total = max(self.height(), initial_ctrl_h + 200)
+        self._controls_splitter.setSizes([total - initial_ctrl_h, initial_ctrl_h])
 
         # ── Status Bar ──
         self.status_label = QtWidgets.QLabel("Ready")
@@ -922,14 +918,10 @@ class FFViewer(QtWidgets.QMainWindow):
         self._ivf_maxs = []
         self._ivf_frames = []
 
-        # View menu to toggle docks
+        # View menu to toggle docks. Controls panel is no longer a
+        # QDockWidget (it lives in a QSplitter inside the central
+        # widget), so it doesn't need a toggle here.
         view_menu = self.menuBar().addMenu('&View')
-        # Controls dock listed first — it's the primary panel and users may
-        # need to bring it back after accidentally closing.
-        ctrl_toggle = self._controls_dock.toggleViewAction()
-        ctrl_toggle.setText('Controls Panel')
-        ctrl_toggle.setShortcut('Ctrl+/')
-        view_menu.addAction(ctrl_toggle)
         view_menu.addAction(self.log_panel.toggleViewAction())
         view_menu.addAction(self._ivf_dock.toggleViewAction())
 
@@ -5956,6 +5948,22 @@ class FFViewer(QtWidgets.QMainWindow):
         log.setReadOnly(True)
         log.setStyleSheet("font-family: monospace; font-size: 13pt;")
         vlay.addWidget(log, 1)
+
+        # Pseudo-strain vs iteration plot. Hidden until _on_ok fills it
+        # with the history — that way a failed run doesn't leave an
+        # empty plot dangling. Log scale so early iters (100s-1000s µɛ)
+        # and converged iters (10s µɛ) share the axis cleanly.
+        strain_plot = pg.PlotWidget()
+        strain_plot.setBackground('w')
+        strain_plot.setMinimumHeight(180)
+        strain_plot.setLabel('left', 'Pseudo-strain', units='µɛ')
+        strain_plot.setLabel('bottom', 'E↔M iteration')
+        strain_plot.setLogMode(x=False, y=True)
+        strain_plot.showGrid(x=True, y=True, alpha=0.3)
+        strain_plot.addLegend(offset=(-10, 10))
+        strain_plot.setVisible(False)
+        vlay.addWidget(strain_plot)
+
         btn_row = QtWidgets.QHBoxLayout()
         cancel_btn = QtWidgets.QPushButton("Cancel")
         close_btn = QtWidgets.QPushButton("Close")
@@ -6081,6 +6089,44 @@ class FFViewer(QtWidgets.QMainWindow):
                 if pr is not None:
                     log.appendPlainText(
                         f'  Post-residual (with corr map): {pr:.2f} µɛ')
+
+                # Populate the pseudo-strain plot with the convergence
+                # history. Three series (mean / median / trim5%) so the
+                # user can see which metric drove the best-iter pick.
+                # Vertical marker at best_iter to make the guardrail
+                # explicit.
+                try:
+                    iters = [h.iteration for h in result.history]
+                    mean_series = [max(h.mean_strain_uE, 1e-6) for h in result.history]
+                    med_series = [max(h.median_strain_uE, 1e-6) for h in result.history]
+                    trim_series = [max(h.trim_strain_uE, 1e-6) for h in result.history]
+                    strain_plot.clear()
+                    # Re-add legend (clear() drops all items including legend)
+                    try:
+                        strain_plot.getPlotItem().legend.clear()
+                    except AttributeError:
+                        pass
+                    strain_plot.plot(iters, mean_series, pen=pg.mkPen('#3cb44b', width=2),
+                                     symbol='o', symbolSize=6, symbolBrush='#3cb44b',
+                                     name='mean')
+                    strain_plot.plot(iters, med_series, pen=pg.mkPen('#4363d8', width=2),
+                                     symbol='s', symbolSize=6, symbolBrush='#4363d8',
+                                     name='median')
+                    strain_plot.plot(iters, trim_series, pen=pg.mkPen('#e6194b', width=2),
+                                     symbol='t', symbolSize=6, symbolBrush='#e6194b',
+                                     name='trim5% (best-iter metric)')
+                    best_i = getattr(result, 'best_iter', None)
+                    if best_i is not None and 0 <= best_i < len(result.history):
+                        vline = pg.InfiniteLine(
+                            pos=best_i, angle=90,
+                            pen=pg.mkPen('#888', width=1, style=QtCore.Qt.DashLine),
+                            label=f'best iter {best_i}',
+                            labelOpts={'position': 0.9, 'color': '#555',
+                                       'movable': False})
+                        strain_plot.addItem(vline)
+                    strain_plot.setVisible(True)
+                except Exception as _e:
+                    print(f'strain-plot render error: {_e}')
 
                 # ── Before / After table ── seed vs refined values for
                 # every panel-visible parameter, with delta. Makes it
