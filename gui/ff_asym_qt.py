@@ -787,7 +787,7 @@ class FFViewer(QtWidgets.QMainWindow):
         # display flip is needed. _on_detector_mode_changed swaps to 'br'
         # when Multi-Det is enabled, because the HYDRA composite stitch
         # introduces an X flip that has to be cancelled at display time.
-        self.image_view = MIDASImageView(self, origin='bl', show_histogram=False)
+        self.image_view = MIDASImageView(self, origin='bl')
         self.image_view.set_colormap(self.colormap_name)
         self.font_spin = self.image_view._font_spin
         # Hide the MIDASImageView's built-in "Font:" pair — we expose the
