@@ -10,6 +10,7 @@ import sys
 import os
 import math
 import tempfile
+import time
 from typing import Optional
 import subprocess
 import threading
@@ -101,6 +102,23 @@ except ImportError:
             HAVE_CIRCLE_FIT = True
         except Exception:
             HAVE_CIRCLE_FIT = False
+
+# Full v2 autocalibrate pipeline. Separate guard from _circle_fit above
+# because this branch pulls in torch, midas_calibrate v1, and other heavy
+# deps. On lightweight installs the arc-fit UI still works.
+autocalibrate_v2 = None
+CalibrationParamsV1 = None
+spec_from_v1_file_v2 = None
+write_v1_paramstest_v2 = None
+HAVE_CALIBRATE_V2_AUTO = False
+try:
+    from midas_calibrate.params import CalibrationParams as CalibrationParamsV1  # type: ignore  # noqa: E402
+    from midas_calibrate_v2.pipelines.single import autocalibrate as autocalibrate_v2  # type: ignore  # noqa: E402
+    from midas_calibrate_v2.compat.from_v1 import spec_from_v1_file as spec_from_v1_file_v2  # type: ignore  # noqa: E402
+    from midas_calibrate_v2.compat.to_v1 import write_v1_paramstest as write_v1_paramstest_v2  # type: ignore  # noqa: E402
+    HAVE_CALIBRATE_V2_AUTO = True
+except ImportError:
+    HAVE_CALIBRATE_V2_AUTO = False
 
 # ── Constants ──
 deg2rad = 0.0174532925199433
@@ -483,6 +501,65 @@ def compute_ring_points(ring_rad, lsd_local, lsd_orig, bc, px,
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  midas-calibrate-v2 worker thread
+# ═══════════════════════════════════════════════════════════════════════
+
+class _CalibrateV2Worker(QtCore.QThread):
+    """Run midas_calibrate_v2.autocalibrate() off the GUI thread.
+
+    autocalibrate has no callback hook, so per-iter progress is captured
+    by redirecting stdout (with verbose=True) and emitting `progress`
+    for each newline-terminated line. Only one worker may run at a time
+    since the stdout redirect is process-global — the launch handler
+    enforces this by disabling the button while a run is in flight."""
+
+    progress = QtCore.pyqtSignal(str)
+    succeeded = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, v1_params, image, dark=None, spec=None, parent=None):
+        super().__init__(parent)
+        self.v1_params = v1_params
+        self.image = image
+        self.dark = dark
+        self.spec = spec
+
+    def run(self):
+        import sys as _sys
+
+        emitter = self.progress
+
+        class _EmittingWriter:
+            def __init__(self):
+                self._buf = ''
+            def write(self, s):
+                if not s:
+                    return
+                self._buf += s
+                while '\n' in self._buf:
+                    line, self._buf = self._buf.split('\n', 1)
+                    if line.strip():
+                        emitter.emit(line)
+            def flush(self):
+                pass
+
+        old_stdout = _sys.stdout
+        _sys.stdout = _EmittingWriter()
+        try:
+            result = autocalibrate_v2(
+                self.v1_params, self.image,
+                dark=self.dark, spec=self.spec,
+                verbose=True, build_residual_corr=False,
+            )
+            self.succeeded.emit(result)
+        except Exception as e:
+            import traceback
+            self.failed.emit(f'{type(e).__name__}: {e}\n\n{traceback.format_exc()}')
+        finally:
+            _sys.stdout = old_stdout
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  FFViewer Main Window
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -752,8 +829,10 @@ class FFViewer(QtWidgets.QMainWindow):
         ctrl_widget.addTab(_wrap_scroll(self._build_image_display_panel()),
                            "&Image / Display")
         ctrl_widget.addTab(_wrap_scroll(self._file_stack), "&Data Source")
+        ctrl_widget.addTab(_wrap_scroll(self._build_rings_panel()),
+                           "&Rings")
         ctrl_widget.addTab(_wrap_scroll(self._build_processing_panel()),
-                           "&Cake / Processing")
+                           "&Calibration")
         ctrl_widget.setCurrentIndex(0)  # Image & Display is the default tab
 
         # Ensure the dock doesn't shrink below one tab bar + a row of
@@ -1470,28 +1549,288 @@ class FFViewer(QtWidgets.QMainWindow):
 
         return grp
 
+    def _build_rings_panel(self):
+        """Standalone tab for the calibrant / ring-generation workflow.
+
+        Holds the Rings Material button plus a live status label showing
+        the currently-loaded ring count, material, and wavelength context.
+        Split out from the Calibration tab so the ring workflow reads as
+        its own step in the calibration process."""
+        grp = QtWidgets.QGroupBox("Calibrant & Rings")
+        lay = QtWidgets.QVBoxLayout(grp)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(10)
+
+        # Row: Rings Material button + Load CIF button, side by side.
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        btn_rings = QtWidgets.QPushButton("Rings Material…")
+        btn_rings.setToolTip(
+            "Choose a calibrant (CeO2, LaB6, AgBe, Si, or custom d-spacings) "
+            "and generate the overlay-ring set. Fills the Rings checkbox in "
+            "the top toolbar with the newly-computed 2θ list.")
+        btn_rings.setMinimumHeight(32)
+        btn_rings.clicked.connect(self._on_ring_selection)
+        btn_row.addWidget(btn_rings)
+
+        btn_cif = QtWidgets.QPushButton("Load CIF…")
+        btn_cif.setToolTip(
+            "Load a Crystallographic Information File (.cif) to populate "
+            "SpaceGroup + Lattice Constants. After load, hit 'Rings Material…' "
+            "to compute rings using the CIF's crystal structure.\n"
+            "Uses midas_hkls.io.cif.read_cif when a CIF backend "
+            "(gemmi / pycifrw) is available; falls back to a minimal "
+            "key/value parser for the standard `_cell_length_*` + "
+            "`_cell_angle_*` + `_space_group_IT_number` fields.")
+        btn_cif.setMinimumHeight(32)
+        btn_cif.clicked.connect(self._on_load_cif)
+        btn_row.addWidget(btn_cif)
+
+        lay.addLayout(btn_row)
+
+        # Status label — reflects current ring set. Updated by
+        # _refresh_rings_status which is called after ring changes
+        # (see _on_ring_selection completion and _on_energy_edited).
+        self._rings_status_label = QtWidgets.QLabel("No rings loaded yet.")
+        self._rings_status_label.setWordWrap(True)
+        self._rings_status_label.setStyleSheet(
+            "color: #444; padding: 6px 8px; "
+            "background-color: rgba(200, 200, 200, 40); "
+            "border-radius: 4px;")
+        lay.addWidget(self._rings_status_label)
+
+        # Prompt / hint below the status.
+        hint = QtWidgets.QLabel(
+            "Set the Energy on the Calibration tab first, then click "
+            "'Rings Material…' to compute the theoretical ring positions "
+            "for your calibrant. The rings drive both the geometry-fit "
+            "buttons (Arc-fit BC/Lsd, Calibrate, Calibrate v2) and the "
+            "on-image ring overlays.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #666; font-size: 9pt;")
+        lay.addWidget(hint)
+
+        lay.addStretch(1)
+        return grp
+
+    def _refresh_rings_status(self):
+        """Update the Rings tab's status label from current ring state."""
+        lbl = getattr(self, '_rings_status_label', None)
+        if lbl is None:
+            return
+        n = len(self.ring_rads) if getattr(self, 'ring_rads', None) else 0
+        if n == 0:
+            lbl.setText("No rings loaded yet.")
+            return
+        parts = [f"<b>{n} rings loaded.</b>"]
+        # Material context, if the ring-selection path populated SpaceGroup
+        # + LatticeConstant. dspacings-only calibrants (AgBe) don't.
+        sg = getattr(self, 'sg', 0)
+        lc = getattr(self, 'lattice_const', None)
+        if sg and lc:
+            try:
+                a = float(lc[0])
+                parts.append(f"Material: SpaceGroup {int(sg)}, a={a:.4f} Å.")
+            except (TypeError, ValueError, IndexError):
+                pass
+        elif getattr(self, 'dspacings', None):
+            parts.append(f"Custom d-spacings ({len(self.dspacings)}).")
+        wl = getattr(self, 'wl', 0)
+        if wl:
+            try:
+                parts.append(
+                    f"Basis wavelength: {wl:.6f} Å "
+                    f"({12.398 / wl:.4f} keV).")
+            except (TypeError, ZeroDivisionError):
+                pass
+        try:
+            px_um = float(getattr(self, 'pixel_size', 0)) or 0.0
+            if px_um > 0:
+                rads_px = sorted(int(round(r / px_um)) for r in self.ring_rads if r)
+                if rads_px:
+                    preview = (', '.join(str(r) for r in rads_px[:8])
+                               + (' …' if len(rads_px) > 8 else ''))
+                    parts.append(f"Ring radii (px): [{preview}]")
+        except (TypeError, ValueError):
+            pass
+        # Last-calibration pseudo-strain, if a calibration has run this
+        # session. Persistent diagnostic — survives the log dialog close.
+        strain = getattr(self, '_last_calib_strain_uE', None)
+        src = getattr(self, '_last_calib_source', 'calibration')
+        if strain is not None:
+            parts.append(
+                f'<b>Last {src} pseudo-strain: {strain:.2f} µɛ.</b>')
+        lbl.setText(' '.join(parts))
+
+    # ── CIF import ────────────────────────────────────────────────────
+
+    def _on_load_cif(self):
+        """Open a CIF file, extract SpaceGroup + Lattice Constants, and
+        populate viewer state. The next Rings Material… run picks them up
+        automatically since RingSelectionDialog reads viewer.sg /
+        viewer.lattice_const at open time."""
+        default_dir = os.getcwd()
+        try:
+            # A couple of sample CIFs ship with midas_hkls tests — useful
+            # starting point when the user has none of their own.
+            hint = os.path.expanduser(
+                '~/opt/midas_saxs_waxs/packages/midas_hkls/tests/data')
+            if os.path.isdir(hint):
+                default_dir = hint
+        except Exception:
+            pass
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load CIF file", default_dir,
+            "CIF files (*.cif *.CIF);;All files (*)")
+        if not fn:
+            return
+        try:
+            crystal = self._parse_cif(fn)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Load CIF",
+                f"Failed to parse CIF:\n{fn}\n\n{type(e).__name__}: {e}")
+            return
+
+        # Push into viewer state — RingSelectionDialog reads these on open.
+        try:
+            self.sg = int(crystal['sg'])
+        except (TypeError, ValueError, KeyError):
+            self.sg = 0
+        lc = crystal.get('lattice')
+        if lc and len(lc) == 6:
+            self.lattice_const = list(lc)
+        name = crystal.get('name') or os.path.basename(fn)
+
+        msg = (f"CIF loaded: <b>{name}</b>. SpaceGroup = {self.sg}, "
+               f"a={self.lattice_const[0]:g} Å, "
+               f"b={self.lattice_const[1]:g} Å, "
+               f"c={self.lattice_const[2]:g} Å, "
+               f"α={self.lattice_const[3]:g}°, "
+               f"β={self.lattice_const[4]:g}°, "
+               f"γ={self.lattice_const[5]:g}°. "
+               "Click 'Rings Material…' to generate rings.")
+        lbl = getattr(self, '_rings_status_label', None)
+        if lbl is not None:
+            lbl.setText(msg)
+        try:
+            self.status_label.setText(f"Loaded CIF: {name}  SG={self.sg}")
+        except AttributeError:
+            pass
+
+    def _parse_cif(self, path):
+        """Extract SpaceGroup + lattice constants from a CIF.
+
+        Prefers ``midas_hkls.io.cif.read_cif`` (full CIF spec support
+        via gemmi/pycifrw). Falls back to a minimal key/value parser
+        when no CIF backend is installed — covers the standard
+        `_cell_length_*` + `_cell_angle_*` + `_space_group_IT_number`
+        form used by every calibration CIF I've seen.
+
+        Returns dict: {'sg': int, 'lattice': [a,b,c,α,β,γ], 'name': str}"""
+        # First try the full parser via midas_hkls (may not be importable
+        # on lightweight envs — falls through to hand-rolled).
+        try:
+            from midas_hkls.io.cif import read_cif  # type: ignore
+            crystal = read_cif(path)
+            return {
+                'sg': int(getattr(crystal.space_group, 'number', 0) or 0),
+                'lattice': [
+                    float(crystal.lattice.a),
+                    float(crystal.lattice.b),
+                    float(crystal.lattice.c),
+                    float(crystal.lattice.alpha),
+                    float(crystal.lattice.beta),
+                    float(crystal.lattice.gamma),
+                ],
+                'name': str(getattr(crystal, 'name', '') or
+                            os.path.splitext(os.path.basename(path))[0]),
+            }
+        except ImportError:
+            pass
+        except Exception as e:
+            # midas_hkls import worked but read_cif failed (e.g. no CIF
+            # backend, or exotic CIF variant). Log and fall through to
+            # the minimal parser.
+            print(f"midas_hkls.read_cif failed on {path}: {e}; "
+                  "using minimal fallback parser")
+
+        # Minimal parser: read the standard tag/value lines and the
+        # data_ block name. Handles both `_cell_length_a 5.4112` and
+        # `_cell_length_a  5.4112(3)` (esd in parens is stripped).
+        tags = {
+            '_cell_length_a':     ('a',  float),
+            '_cell_length_b':     ('b',  float),
+            '_cell_length_c':     ('c',  float),
+            '_cell_angle_alpha':  ('al', float),
+            '_cell_angle_beta':   ('be', float),
+            '_cell_angle_gamma':  ('ga', float),
+            '_space_group_it_number':      ('sg', int),
+            '_symmetry_int_tables_number': ('sg', int),
+        }
+        out = {}
+        name = os.path.splitext(os.path.basename(path))[0]
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if line.lower().startswith('data_'):
+                    name = line[5:].strip() or name
+                    continue
+                parts = line.split(None, 1)
+                if len(parts) != 2:
+                    continue
+                key = parts[0].lower()
+                val = parts[1].strip().strip("'").strip('"')
+                # Strip esd in parens: "5.4112(3)" -> "5.4112"
+                paren = val.find('(')
+                if paren > 0:
+                    val = val[:paren]
+                if key not in tags:
+                    continue
+                short, caster = tags[key]
+                try:
+                    out[short] = caster(val)
+                except ValueError:
+                    continue
+        # Assemble.
+        need = ('a', 'b', 'c', 'al', 'be', 'ga')
+        missing = [k for k in need if k not in out]
+        if missing:
+            raise ValueError(f"Missing tags in CIF: {missing}")
+        return {
+            'sg':      int(out.get('sg', 0)),
+            'lattice': [out['a'], out['b'], out['c'],
+                        out['al'], out['be'], out['ga']],
+            'name':    name,
+        }
+
     def _build_processing_panel(self):
         grp = QtWidgets.QGroupBox("Detector & Rings")
         lay = QtWidgets.QGridLayout(grp)
         lay.setContentsMargins(6, 4, 6, 4)
         lay.setVerticalSpacing(2)
         lay.setHorizontalSpacing(4)
+        # Two symmetric halves side by side (label|edit|refine|tol each),
+        # with a spacer column between them. Halves the vertical footprint
+        # so all 10 params + Energy fit without scrolling on typical dock
+        # heights.
+        #   Left half : cols 0..3
+        #   Spacer    : col 4  (stretches to eat leftover width)
+        #   Right half: cols 5..8
+        for c in (4,):
+            lay.setColumnStretch(c, 1)
 
-        # 4-column layout so each row can grow a per-parameter refinement
-        # toggle + tolerance edit (GSAS-2 style):
-        #   col 0: label   col 1: value edit   col 2: ☐ Refine   col 3: ± tol
         # Registries so _launch_calibration can look up each param's
         # flag/tol without hardcoding widget names.
         self._refine_checks: dict = {}
         self._refine_tols: dict = {}
 
-        btn_rings = QtWidgets.QPushButton("Rings Material")
-        btn_rings.setToolTip(
-            "Choose a calibrant (CeO2, LaB6, AgBe, Si, or custom d-spacings) "
-            "and generate the overlay-ring set. Fills the Rings checkbox in "
-            "the top toolbar with the newly-computed 2θ list.")
-        btn_rings.clicked.connect(self._on_ring_selection)
-        lay.addWidget(btn_rings, 0, 0)
+        # Rings Material button lives in its own "Rings" tab now
+        # (see _build_rings_panel). Arc-fit stays here because it
+        # writes BC/Lsd directly into the geometry fields below.
         btn_arcfit = QtWidgets.QPushButton("Arc-fit BC/Lsd…")
         btn_arcfit.setToolTip(
             "Click 5+ points on visible ring arcs to derive a sub-pixel BC "
@@ -1499,32 +1838,38 @@ class FFViewer(QtWidgets.QMainWindow):
             "beam is off-detector or arcs are heavily occluded. Requires "
             "midas-calibrate-v2.")
         btn_arcfit.clicked.connect(self._open_arc_fit_dialog)
-        lay.addWidget(btn_arcfit, 0, 1)
-        # Column headers over the refinement controls.
-        hdr_ref = QtWidgets.QLabel("Refine?")
-        hdr_ref.setStyleSheet("color: #555;")
-        hdr_ref.setAlignment(QtCore.Qt.AlignCenter)
-        lay.addWidget(hdr_ref, 0, 2)
-        hdr_tol = QtWidgets.QLabel("± margin")
-        hdr_tol.setStyleSheet("color: #555;")
-        hdr_tol.setAlignment(QtCore.Qt.AlignCenter)
-        lay.addWidget(hdr_tol, 0, 3)
+        lay.addWidget(btn_arcfit, 0, 0, 1, 2)
+        # Column headers — one set per half.
+        def _add_header(text, col):
+            lbl = QtWidgets.QLabel(text)
+            lbl.setStyleSheet("color: #555;")
+            lbl.setAlignment(QtCore.Qt.AlignCenter)
+            lay.addWidget(lbl, 0, col)
+        _add_header("Refine?", 2)
+        _add_header("± margin", 3)
+        _add_header("Refine?", 7)
+        _add_header("± margin", 8)
 
         def _add_refine(row: int, name: str, tol_default: float,
-                        tip: str = ''):
-            """Add the Refine checkbox (col 2) + tolerance edit (col 3)
-            for the parameter on ``row`` and register it under ``name``."""
+                        tip: str = '', col_offset: int = 0):
+            """Add the Refine checkbox + tolerance edit for the parameter
+            on ``row`` and register it under ``name``. ``col_offset`` = 0
+            puts the pair at cols (2, 3); ``col_offset`` = 5 puts it at
+            cols (7, 8) — the right-hand half."""
+            refine_col = 2 + col_offset
+            tol_col = 3 + col_offset
             cb = QtWidgets.QCheckBox()
             cb.setToolTip('Include this parameter in MIDAS calibration '
                           'refinement.\n' + tip)
-            lay.addWidget(cb, row, 2, alignment=QtCore.Qt.AlignCenter)
+            lay.addWidget(cb, row, refine_col,
+                          alignment=QtCore.Qt.AlignCenter)
             self._refine_checks[name] = cb
             tol = QtWidgets.QLineEdit(f'{tol_default:g}')
             tol.setFixedWidth(70)
             tol.setToolTip('Maximum ± change allowed during refinement.\n'
                            'Also used as MIDAS tolX (0 → parameter locked).\n'
                            + tip)
-            lay.addWidget(tol, row, 3)
+            lay.addWidget(tol, row, tol_col)
             self._refine_tols[name] = tol
             # Grey the tol edit when refine is unchecked so the two
             # controls read as one intent (matches [[feedback-disable-vs-hide]]).
@@ -1609,6 +1954,11 @@ class FFViewer(QtWidgets.QMainWindow):
         #                 + p2·R̂²
         # where R̂ = R/RhoD (RhoD = MaxRingRad from the param file).
         # Rings redraw live so users can visually match rings to peaks.
+        #
+        # Placed on the RIGHT half (cols 5..8) starting at row 1 so the
+        # panel's total height is bounded by the taller of the two
+        # halves (geometry = 6 rows, distortion+energy = 5 rows). Halves
+        # the vertical footprint vs the pre-two-column layout.
         self._distortion_tooltip = (
             "MIDAS radial-distortion coefficient.\n"
             "DistortFunc = 1 + p0·R̂²·cos(2·EtaT+p6) + p1·R̂⁴·cos(4·EtaT+p3) + p2·R̂²\n"
@@ -1616,23 +1966,26 @@ class FFViewer(QtWidgets.QMainWindow):
         for row, (name, attr, tol_def) in enumerate((
                 ('p0', 'p0_edit', 2e-3), ('p1', 'p1_edit', 2e-3),
                 ('p2', 'p2_edit', 2e-3), ('p3 (deg)', 'p3_edit', 45.0))):
-            lay.addWidget(QtWidgets.QLabel(name), 7 + row, 0)
+            r = 1 + row   # place on right half starting from row 1
+            lay.addWidget(QtWidgets.QLabel(name), r, 5)
             key = name.split()[0]   # 'p0', 'p1', 'p2', 'p3'
             local = getattr(self, f'{key}_local')
             ed = QtWidgets.QLineEdit(str(local))
             ed.setMinimumWidth(90)
             ed.setToolTip(self._distortion_tooltip)
-            lay.addWidget(ed, 7 + row, 1)
+            lay.addWidget(ed, r, 6)
             setattr(self, attr, ed)
-            _add_refine(7 + row, key, tol_def,
+            _add_refine(r, key, tol_def,
                         f'Distortion coefficient {key}. Written to ps.txt '
                         f'as tol{key.upper() if key != "p0" else "P"} '
-                        f'during refinement (0 → locked).')
+                        f'during refinement (0 → locked).',
+                        col_offset=5)
 
         # Energy (keV). Live-editable — changing it re-scales the cached
         # ring radii via Bragg's law (rescaled by the new wavelength).
-        # Kept in sync with self.wl (which is stored in Å).
-        lay.addWidget(QtWidgets.QLabel("Energy (keV)"), 11, 0)
+        # Kept in sync with self.wl (which is stored in Å). Placed on the
+        # right half, row 5 (below the four p-coefficients).
+        lay.addWidget(QtWidgets.QLabel("Energy (keV)"), 5, 5)
         self.energy_edit = QtWidgets.QLineEdit(
             f'{12.398 / self.wl:.4f}' if self.wl else '')
         self.energy_edit.setMinimumWidth(90)
@@ -1641,7 +1994,7 @@ class FFViewer(QtWidgets.QMainWindow):
             "Editing this rescales existing ring radii via Bragg's law "
             "using each ring's cached d-spacing — no need to re-run "
             "Rings Material after an energy change.")
-        lay.addWidget(self.energy_edit, 11, 1)
+        lay.addWidget(self.energy_edit, 5, 6)
 
         # Calibrate / Save row. Calibrate launches MIDAS refinement using
         # the checked parameters + tolerances; Save writes the current
@@ -1666,6 +2019,15 @@ class FFViewer(QtWidgets.QMainWindow):
             "dataLoc/darkLoc (HDF5 paths), and DarkStem/Dark.")
         action_row.addWidget(self.instr_only_check)
         action_row.addSpacing(12)
+        self.zero_tilts_btn = QtWidgets.QPushButton("Zero tilts")
+        self.zero_tilts_btn.setToolTip(
+            "Reset Tx/Ty/Tz to 0 and uncheck their refine flags. Use when a\n"
+            "previous calibration ran away into a nonphysical tilt basin\n"
+            "(e.g. Tz ≈ 13°) — clears the bad seed so the next refinement\n"
+            "starts from a clean geometry with only Lsd + BC free.")
+        self.zero_tilts_btn.clicked.connect(self._zero_tilts)
+        action_row.addWidget(self.zero_tilts_btn)
+        action_row.addSpacing(12)
         self.calibrate_btn = QtWidgets.QPushButton("Calibrate…")
         self.calibrate_btn.setToolTip(
             "Refine every checked parameter within its ± margin using MIDAS.\n"
@@ -1673,6 +2035,15 @@ class FFViewer(QtWidgets.QMainWindow):
             "Rings Material.")
         self.calibrate_btn.clicked.connect(self._launch_calibration)
         action_row.addWidget(self.calibrate_btn)
+        self.calibrate_v2_btn = QtWidgets.QPushButton("Calibrate (v2)…")
+        self.calibrate_v2_btn.setToolTip(
+            "Refine every checked parameter with midas-calibrate-v2\n"
+            "(PyTorch, in-process, autograd LM). Alternative to Calibrate…\n"
+            "which spawns the C binary CalibrantIntegratorOMP. Same ps.txt\n"
+            "seed, same Refine? / ± margin controls. Requires\n"
+            "midas-calibrate-v2 installed in the runtime env.")
+        self.calibrate_v2_btn.clicked.connect(self._launch_calibration_v2)
+        action_row.addWidget(self.calibrate_v2_btn)
         self.save_params_btn = QtWidgets.QPushButton("Save params…")
         self.save_params_btn.setToolTip(
             "Write the current detector geometry (Lsd, BC, tilts, "
@@ -1681,10 +2052,13 @@ class FFViewer(QtWidgets.QMainWindow):
             "flow and with downstream MIDAS tools.")
         self.save_params_btn.clicked.connect(self._save_params_to_file)
         action_row.addWidget(self.save_params_btn)
-        lay.addLayout(action_row, 12, 0, 1, 4)
+        # Action row lives below both parameter halves — geometry (left,
+        # rows 1..6) and distortion+energy (right, rows 1..5). Spans all
+        # 9 columns of the two-half grid.
+        lay.addLayout(action_row, 7, 0, 1, 9)
 
         # See _build_image_display_panel: same trick to keep rows packed at top.
-        lay.setRowStretch(13, 1)
+        lay.setRowStretch(8, 1)
 
         return grp
 
@@ -1925,6 +2299,11 @@ class FFViewer(QtWidgets.QMainWindow):
         self.bcy_edit.editingFinished.connect(self._redraw_if_rings)
         self.bcz_edit.editingFinished.connect(self._redraw_if_rings)
         self.lsd_edit.editingFinished.connect(self._redraw_if_rings)
+        # Auto-pick pixel size when Pixels H/V change to a known preset
+        # shape (Varex 2880 → 150 µm, Eiger 16M → 75 µm, etc.). Silent
+        # no-op for shapes that don't match a preset.
+        self.ny_edit.editingFinished.connect(self._on_shape_edited)
+        self.nz_edit.editingFinished.connect(self._on_shape_edited)
         # Tx rotates the displayed image AND changes the projected ring
         # shape. Ty / Tz don't rotate the image but they DO tilt the
         # detector plane, so both distort circles into ellipses on the
@@ -3682,6 +4061,18 @@ class FFViewer(QtWidgets.QMainWindow):
             self._detect_hdf5_dims(fn)
         elif ext_lower in ['.tif', '.tiff'] and tifffile is not None:
             self._detect_tiff_dims(fn)
+        # Raw binaries (.geN, .bin) skip the two probes above — ny/nz are
+        # already set from prior session / param file / defaults. Consult
+        # the shape preset ONLY for the narrow allow-list where the HDF5
+        # metadata is known to lie (currently: varexD @ 2880²). Everything
+        # else — including GE @ 2048² — keeps whatever pixel_size is
+        # already set, matching prior behavior.
+        try:
+            _shape = (int(self.ny), int(self.nz))
+        except (TypeError, ValueError):
+            _shape = None
+        if _shape in self._PREFER_PRESET_OVER_NX_SHAPES:
+            self._on_shape_edited()
         print(f"Loaded: stem={self.file_stem}, folder={self.folder}, ext={self.ext}")
         self._load_and_display()
 
@@ -3703,6 +4094,12 @@ class FFViewer(QtWidgets.QMainWindow):
                 if hasattr(self, 'nframes_edit'):
                     self.nframes_edit.setText(str(n_pages))
                 self._update_frame_max_label()
+                # Restrict to the allow-list: never touches GE / Eiger /
+                # Pilatus pixel_size on TIFF open.
+                if (int(self.ny), int(self.nz)) in self._PREFER_PRESET_OVER_NX_SHAPES:
+                    match = self._lookup_shape_preset(self.ny, self.nz)
+                    if match is not None:
+                        self._apply_pixel_size(match[0], match[1])
         except Exception as e:
             print(f"TIFF dimension detection failed: {e}")
 
@@ -3782,7 +4179,7 @@ class FFViewer(QtWidgets.QMainWindow):
         ((2527, 2463), 172.0, 'Pilatus3 6M'),
         ((1679, 1475), 172.0, 'Pilatus3 2M'),
         ((2880, 2880),  150.0, 'Varex 2880'),
-        ((2048, 2048),  200.0, 'Varex 2048 / GE'),
+        ((2048, 2048),  200.0, 'GE 41RT'),
         # Pixirad configurations at APS 1-ID-E (CdTe, 62 µm pixels).
         ((476, 1024),   62.0, 'Pixirad-2 CdTe'),
         ((1024, 476),   62.0, 'Pixirad-2 CdTe (transposed)'),
@@ -3792,46 +4189,86 @@ class FFViewer(QtWidgets.QMainWindow):
         ((512, 3232),   62.0, 'Pixirad-8 CdTe (transposed)'),
     )
 
+    # Shapes whose NX pixel_size metadata is known to be wrong at APS —
+    # trust the shape preset instead. Everything else follows the historical
+    # "NX metadata first, preset fallback" order so GE / Eiger / Pilatus
+    # workflows keep their existing behavior.
+    _PREFER_PRESET_OVER_NX_SHAPES = frozenset({
+        (2880, 2880),  # varexD — HDF5 files at 1-ID claim 200 µm, real is 150
+    })
+
     def _detect_hdf5_pixel_size(self, f) -> None:
-        """Populate self.pixel_size from NX detector metadata, or fall
-        back to a shape-based preset (Eiger / Pilatus / Varex). Safe to
-        call on non-standard files — no-ops if nothing matches."""
+        """Populate self.pixel_size from NX metadata or the shape preset.
+        For detectors with known-bad NX metadata (see
+        ``_PREFER_PRESET_OVER_NX_SHAPES``), the preset wins over NX.
+        For everything else, NX metadata is consulted first and the preset
+        is a fallback (historical behavior — do not change without checking
+        every downstream detector)."""
         px_um = None
         detector_name = None
+        shape = None
         try:
-            # Try each canonical NX path in order; first hit wins.
-            for gpath, xkey, ykey in self._NX_PIXEL_SIZE_PATHS:
-                if gpath not in f:
-                    continue
-                grp = f[gpath]
-                if xkey not in grp:
-                    continue
-                val = grp[xkey]
-                px_val = float(val[()] if val.shape == () else val[0])
-                # NX standard is metres; APS-style often µm. Heuristic:
-                # anything ≥ 1e-3 is already in µm; smaller is metres.
-                px_um = px_val * 1e6 if px_val < 1e-3 else px_val
-                if 'description' in grp:
-                    try:
-                        d = grp['description']
-                        raw = d[()] if d.shape == () else d[0]
-                        detector_name = (raw.decode() if isinstance(raw, bytes)
-                                         else str(raw))
-                    except Exception:
-                        pass
-                break
-        except Exception as e:
-            print(f"HDF5 pixel-size probe error: {e}")
-        # Shape-based fallback for detectors that don't advertise NX metadata.
-        if px_um is None:
             shape = (int(self.ny), int(self.nz))
-            for match, default_um, name in self._DETECTOR_SHAPE_PRESETS:
-                if shape == match:
-                    px_um = default_um
-                    detector_name = detector_name or name
+        except (TypeError, ValueError):
+            pass
+        # 1. Shape-preset first ONLY for the narrow allow-list of detectors
+        # whose HDF5 metadata we know to be wrong.
+        if shape in self._PREFER_PRESET_OVER_NX_SHAPES:
+            match = self._lookup_shape_preset(self.ny, self.nz)
+            if match is not None:
+                px_um, detector_name = match
+        # 2. NX metadata (canonical path for all other detectors, and for
+        # the allow-list shapes when the preset unexpectedly didn't match).
+        if px_um is None:
+            try:
+                for gpath, xkey, ykey in self._NX_PIXEL_SIZE_PATHS:
+                    if gpath not in f:
+                        continue
+                    grp = f[gpath]
+                    if xkey not in grp:
+                        continue
+                    val = grp[xkey]
+                    px_val = float(val[()] if val.shape == () else val[0])
+                    # NX standard is metres; APS-style often µm. Heuristic:
+                    # anything ≥ 1e-3 is already in µm; smaller is metres.
+                    px_um = px_val * 1e6 if px_val < 1e-3 else px_val
+                    if 'description' in grp:
+                        try:
+                            d = grp['description']
+                            raw = d[()] if d.shape == () else d[0]
+                            detector_name = (raw.decode() if isinstance(raw, bytes)
+                                             else str(raw))
+                        except Exception:
+                            pass
                     break
+            except Exception as e:
+                print(f"HDF5 pixel-size probe error: {e}")
+        # 3. Historical shape-preset fallback: applies for shapes NOT in the
+        # allow-list when NX metadata was absent. Preserves the pre-existing
+        # behavior for GE / Eiger / Pilatus / Pixirad HDF5 files that don't
+        # ship pixel_size in their metadata.
+        if px_um is None:
+            match = self._lookup_shape_preset(self.ny, self.nz)
+            if match is not None:
+                px_um, name = match
+                detector_name = detector_name or name
         if px_um is None or px_um <= 0:
             return
+        self._apply_pixel_size(px_um, detector_name)
+
+    def _lookup_shape_preset(self, ny, nz):
+        """Return (px_um, human_name) for a matching preset, or None."""
+        try:
+            shape = (int(ny), int(nz))
+        except (TypeError, ValueError):
+            return None
+        for match, default_um, name in self._DETECTOR_SHAPE_PRESETS:
+            if shape == match:
+                return default_um, name
+        return None
+
+    def _apply_pixel_size(self, px_um, detector_name=None):
+        """Set self.pixel_size, sync the px edit, and flash a status message."""
         self.pixel_size = float(px_um)
         try:
             self.px_edit.setText(f'{self.pixel_size:g}')
@@ -3844,6 +4281,27 @@ class FFViewer(QtWidgets.QMainWindow):
             self.status_label.setText(msg)
         except AttributeError:
             pass
+
+    def _on_shape_edited(self):
+        """When the user edits Pixels H/V, auto-set pixel size ONLY for
+        shapes in ``_PREFER_PRESET_OVER_NX_SHAPES`` (currently: varexD @
+        2880²). Every other shape keeps the historical behavior of leaving
+        pixel_size alone on manual edit, so GE / Eiger / Pilatus workflows
+        are not silently altered."""
+        try:
+            ny = int(self.ny_edit.text())
+            nz = int(self.nz_edit.text())
+        except (ValueError, AttributeError):
+            return
+        if (ny, nz) not in self._PREFER_PRESET_OVER_NX_SHAPES:
+            return
+        match = self._lookup_shape_preset(ny, nz)
+        if match is None:
+            return
+        px_um, name = match
+        if float(self.pixel_size) == float(px_um):
+            return  # already correct — don't spam the status line
+        self._apply_pixel_size(px_um, name)
 
     def _on_browse_mask(self):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -4360,6 +4818,21 @@ class FFViewer(QtWidgets.QMainWindow):
     def _load_and_display(self):
         """Load current frame and display."""
         self._sync_params()
+        # After _sync_params (which reads px_edit → self.pixel_size),
+        # force the shape-preset correction for detectors on the
+        # known-bad-metadata allow-list (currently: varexD @ 2880²).
+        # This is the belt-and-suspenders backstop for file-open paths
+        # that bypass _detect_hdf5_pixel_size (raw binary, zarr, TIFFs
+        # without embedded pixel size). Narrow allow-list means we don't
+        # stomp on any other detector's manual pixel_size choice.
+        try:
+            shape = (int(self.ny), int(self.nz))
+            if shape in self._PREFER_PRESET_OVER_NX_SHAPES:
+                match = self._lookup_shape_preset(*shape)
+                if match is not None and float(self.pixel_size) != float(match[0]):
+                    self._apply_pixel_size(match[0], match[1])
+        except (TypeError, ValueError, AttributeError):
+            pass
         # Re-check H5 dataset path validity now that any new file/path is in.
         self._validate_h5_paths()
 
@@ -4781,7 +5254,29 @@ class FFViewer(QtWidgets.QMainWindow):
         Uses the viewer's live state for detector geometry, wavelength,
         rings, and file locations, and adds the per-parameter tolX keys
         from the Detector Rings refine controls. Returns None on missing
-        prerequisites (data file, wavelength, or rings)."""
+        prerequisites (data file, wavelength, or rings).
+
+        Calls `_sync_params()` first so recent edits to Pixels H/V,
+        Pixel Size (μm), etc. are reflected in the serialised state —
+        those live on `self.ny/self.nz/self.pixel_size` rather than
+        being read from their edits at emit time. Without this, a user
+        who nudged Pixel Size and hit Calibrate without re-loading
+        would seed the fit with a stale value."""
+        try:
+            self._sync_params()
+        except Exception:
+            # _sync_params can raise if edits are mid-typing; fall back
+            # to whatever state we have rather than aborting.
+            pass
+        # Refresh wavelength from the Energy edit too — energy_edit's
+        # editingFinished handler normally updates self.wl, but the
+        # button click may pre-empt focus loss in some styles.
+        try:
+            e_kev = float(self.energy_edit.text())
+            if e_kev > 0:
+                self.wl = 12.398 / e_kev
+        except (ValueError, AttributeError):
+            pass
         data_fn = self._current_data_file()
         if not data_fn:
             return None
@@ -4874,13 +5369,37 @@ class FFViewer(QtWidgets.QMainWindow):
             dtype = 2   # fall through to ge for calibration path
         lines.append(f'DataType {dtype}')
 
-        # Ring restriction — refine ONLY against rings the user picked
-        # in Rings Material (the ones drawn on the image). Without this,
-        # CalibrantIntegratorOMP would fit against every ring GetHKLList
-        # generates (70+ for CeO2), including many the user rejected as
-        # off-detector or contaminated.
-        for rn in (self.ring_nrs or []):
-            lines.append(f'RingThresh {int(rn)} 100')
+        # Ring restriction for the calibration path.
+        #
+        # CalibrantIntegratorOMP does NOT parse RingThresh (confirmed by
+        # grep: RingThresh lives only in the Zarr tools — CalcRadiusAllZarr,
+        # FitSetupParamsAllZarr, PeaksFittingOMPZarrRefactor, FitMultipleGrains).
+        # For the OMP calibrator, ring set is filtered by MaxRingNumber
+        # (cap) + RingsToExclude (explicit exclusion). Without both, it
+        # fits every ring GetHKLList emits (17+ for CeO2).
+        #
+        # We still emit RingThresh lines because the same ps.txt is often
+        # reused by downstream Zarr tools where RingThresh IS honored as
+        # a per-ring peak-intensity floor. Value 10 matches MIDAS's own
+        # Parameters.txt example.
+        selected = sorted({int(rn) for rn in (self.ring_nrs or [])})
+        for rn in selected:
+            lines.append(f'RingThresh {rn} 10')
+        if selected:
+            max_rn = selected[-1]
+            lines.append(f'MaxRingNumber {max_rn}')
+            excluded = [n for n in range(1, max_rn + 1) if n not in set(selected)]
+            # MIDAS's RingsExclude[50] array caps at 50 entries — hard to
+            # imagine a legitimate calibration exceeding that, but truncate
+            # defensively with a log warning if it happens.
+            if len(excluded) > 50:
+                print(f"[calibrate] warning: RingsToExclude has "
+                      f"{len(excluded)} entries; truncating to 50 "
+                      f"(MIDAS array cap). Consider picking a contiguous "
+                      f"range of rings instead of scattered ones.")
+                excluded = excluded[:50]
+            for rn in excluded:
+                lines.append(f'RingsToExclude {rn}')
 
         # Mask + bad-pixel sentinels. Forwards the user's Apply-mask
         # setting from the Data Source panel so gap/dead pixels don't
@@ -5063,6 +5582,28 @@ class FFViewer(QtWidgets.QMainWindow):
         except AttributeError:
             pass
 
+    def _zero_tilts(self):
+        """Reset Tx/Ty/Tz to 0 and uncheck their refine flags — escape hatch
+        for a calibration that ran away into a nonphysical tilt basin."""
+        cleared = []
+        for name, edit_attr in (('Tx', 'tx_edit'), ('Ty', 'ty_edit'), ('Tz', 'tz_edit')):
+            ed = getattr(self, edit_attr, None)
+            if ed is not None:
+                old = ed.text().strip()
+                if old and old != '0' and old != '0.0':
+                    cleared.append(f'{name}={old}→0')
+                ed.setText('0')
+                ed.editingFinished.emit()  # trigger ring redraw
+            cb = self._refine_checks.get(name)
+            if cb is not None:
+                cb.setChecked(False)
+        try:
+            msg = ('Tilts zeroed and refine unchecked'
+                   + (f' ({", ".join(cleared)})' if cleared else ''))
+            self.status_label.setText(msg)
+        except AttributeError:
+            pass
+
     def _launch_calibration(self):
         """Spawn CalibrantIntegratorOMP on the currently displayed image
         with the per-parameter refine flags/tolerances. Stdout streams
@@ -5127,7 +5668,10 @@ class FFViewer(QtWidgets.QMainWindow):
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("MIDAS calibration — CalibrantIntegratorOMP")
         dlg.setModal(True)
-        dlg.resize(820, 560)
+        dlg.resize(960, 680)
+        dlg_font = dlg.font()
+        dlg_font.setPointSize(max(12, dlg_font.pointSize() + 2))
+        dlg.setFont(dlg_font)
         vlay = QtWidgets.QVBoxLayout(dlg)
         hdr = QtWidgets.QLabel(f"Running: {exe} {ps_path} {n_cpus}")
         hdr.setWordWrap(True)
@@ -5135,7 +5679,7 @@ class FFViewer(QtWidgets.QMainWindow):
         vlay.addWidget(hdr)
         log = QtWidgets.QPlainTextEdit()
         log.setReadOnly(True)
-        log.setStyleSheet("font-family: monospace; font-size: 10pt;")
+        log.setStyleSheet("font-family: monospace; font-size: 13pt;")
         vlay.addWidget(log, 1)
         btn_row = QtWidgets.QHBoxLayout()
         cancel_btn = QtWidgets.QPushButton("Cancel")
@@ -5239,6 +5783,600 @@ class FFViewer(QtWidgets.QMainWindow):
         proc.start(exe, [ps_path, str(n_cpus)])
         dlg.exec_()
 
+    # ── midas-calibrate-v2 in-process calibration ─────────────────────
+    #
+    # Peer to _launch_calibration but uses midas_calibrate_v2's autograd
+    # LM in the current process, no subprocess. Reuses the same ps.txt
+    # emitted by _build_full_calibration_ps_txt so the seed + Refine? +
+    # ± margin controls apply verbatim. Runs on a QThread with per-line
+    # stdout captured into the log dialog.
+
+    def _launch_calibration_v2(self):
+        """In-process refinement via midas_calibrate_v2.autocalibrate.
+
+        Same seed/refine controls as _launch_calibration; different
+        engine. Grabs the currently displayed image (post-transforms,
+        post-aggregation) so results match what the user sees on screen."""
+        if not HAVE_CALIBRATE_V2_AUTO:
+            QtWidgets.QMessageBox.information(
+                self, "Calibrate (v2)",
+                "midas-calibrate-v2 is not installed in this environment.\n\n"
+                "On acadia (with internet):\n"
+                "    pip install -e ~/opt/midas_saxs_waxs/packages/midas_calibrate\n"
+                "    pip install -e ~/opt/midas_saxs_waxs/packages/midas_integrate\n"
+                "    pip install -e ~/opt/midas_saxs_waxs/packages/midas_calibrate_v2\n\n"
+                "copland has no internet — install on acadia first.")
+            return
+        if not self.ring_rads:
+            QtWidgets.QMessageBox.warning(
+                self, "Calibrate (v2)",
+                "No rings generated yet. Use 'Rings Material' first so "
+                "the fit has ring positions to refine against.")
+            return
+        content = self._build_full_calibration_ps_txt()
+        if content is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Calibrate (v2)",
+                "Missing prerequisites for calibration. Need:\n"
+                "  • a loaded data file\n"
+                "  • a wavelength (set Energy on Detector Rings)\n"
+                "  • at least one ring from Rings Material")
+            return
+        image = getattr(self.image_view, '_raw_data', None)
+        if image is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Calibrate (v2)",
+                "No image currently displayed. Load a frame first.")
+            return
+
+        # v2 wants a numpy array, shape (NrPixelsZ, NrPixelsY), any dtype.
+        # The image_view stores (rows, cols) already in that convention.
+        try:
+            image = np.asarray(image)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Calibrate (v2)",
+                f"Could not coerce current image to numpy: {e}")
+            return
+
+        # Serialize current state to a temp ps.txt and parse into
+        # CalibrationParams. Same seed the v1 button uses — no divergence.
+        tmpdir = tempfile.mkdtemp(prefix='ffcalv2_')
+        ps_path = os.path.join(tmpdir, 'ps.txt')
+        try:
+            with open(ps_path, 'w') as f:
+                f.write(content)
+            v1 = CalibrationParamsV1.from_file(ps_path)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Calibrate (v2)",
+                f"Failed to parse seed ps.txt into v1 CalibrationParams:\n{e}")
+            return
+
+        # v2's E-step goes through midas_integrate.build_map, which needs
+        # RBinSize > 0 and pixel-space RMin/RMax for the cake — the C
+        # binary CalibrantIntegratorOMP (the v1 button) has its own
+        # defaults so our ps.txt doesn't emit these keys. Patch
+        # reasonable MIDAS defaults on the parsed v1 params so this call
+        # path works without touching the v1 button's ps.txt writer.
+        #
+        # UNIT CAUTION: self.ring_rads is in µm (from lsd·tan(2θ) where
+        # lsd is µm). midas_integrate's RMin/RMax are in PIXELS. Convert
+        # explicitly — using ring_rads as RMax directly would size the
+        # cake to hundreds of thousands of radial bins and hang the run.
+        def _needs_default(attr):
+            try:
+                v = float(getattr(v1, attr, 0) or 0)
+                return v <= 0
+            except (TypeError, ValueError):
+                return True
+        if _needs_default('RBinSize'):
+            v1.RBinSize = 2.0
+        if _needs_default('EtaBinSize'):
+            v1.EtaBinSize = 1.0
+        # Ring radii in pixels, using the current pixel size.
+        try:
+            px_um = float(self.pixel_size) or 200.0
+        except (TypeError, ValueError):
+            px_um = 200.0
+        ring_rads_px = [float(r) / px_um for r in self.ring_rads if r]
+        if _needs_default('RMin'):
+            if ring_rads_px:
+                v1.RMin = max(1.0, min(ring_rads_px) - 20.0)
+            else:
+                v1.RMin = 10.0
+        if _needs_default('RMax'):
+            if ring_rads_px:
+                v1.RMax = max(ring_rads_px) + 20.0
+            else:
+                # Fallback: half the detector diagonal
+                try:
+                    ny = float(self.ny); nz = float(self.nz)
+                    v1.RMax = 0.5 * math.hypot(ny, nz)
+                except (TypeError, ValueError):
+                    v1.RMax = 2000.0
+
+        # spec honours RingsToExclude / hex-pixel keys if present; safe
+        # to skip on failure since our ps.txt currently emits neither.
+        try:
+            spec = spec_from_v1_file_v2(ps_path)
+        except Exception:
+            spec = None
+
+        # Snapshot before-values for the summary table. Read from the
+        # parsed v1 params so units match v2's unpacked output.
+        def _get_attr(obj, name, default=None):
+            try:
+                v = getattr(obj, name, default)
+                return None if v is None else float(v)
+            except (TypeError, ValueError):
+                return default
+        before = {
+            'Lsd':        _get_attr(v1, 'Lsd'),
+            'BC_y':       _get_attr(v1, 'BC_y'),
+            'BC_z':       _get_attr(v1, 'BC_z'),
+            'ty':         _get_attr(v1, 'ty'),
+            'tz':         _get_attr(v1, 'tz'),
+            'p0':         _get_attr(v1, 'p0'),
+            'p1':         _get_attr(v1, 'p1'),
+            'p2':         _get_attr(v1, 'p2'),
+            'p3':         _get_attr(v1, 'p3'),
+            'Wavelength': _get_attr(v1, 'Wavelength'),
+        }
+
+        # Modal log dialog matching the v1 flow's look & feel.
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("MIDAS calibration — autocalibrate (v2)")
+        dlg.setModal(True)
+        dlg.resize(960, 680)
+        dlg_font = dlg.font()
+        dlg_font.setPointSize(max(12, dlg_font.pointSize() + 2))
+        dlg.setFont(dlg_font)
+        vlay = QtWidgets.QVBoxLayout(dlg)
+        hdr = QtWidgets.QLabel(
+            f"Running v2 autocalibrate on {image.shape[0]}×{image.shape[1]} "
+            f"({image.dtype}) image, seed ps.txt at {ps_path}")
+        hdr.setWordWrap(True)
+        hdr.setStyleSheet("color: #555;")
+        vlay.addWidget(hdr)
+        log = QtWidgets.QPlainTextEdit()
+        log.setReadOnly(True)
+        log.setStyleSheet("font-family: monospace; font-size: 13pt;")
+        vlay.addWidget(log, 1)
+        btn_row = QtWidgets.QHBoxLayout()
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.setEnabled(False)
+        apply_btn = QtWidgets.QPushButton("Apply refined values")
+        apply_btn.setEnabled(False)
+        apply_btn.setDefault(True)
+        save_btn = QtWidgets.QPushButton("Save refined ps.txt…")
+        save_btn.setEnabled(False)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(apply_btn)
+        btn_row.addWidget(close_btn)
+        vlay.addLayout(btn_row)
+
+        # Disable both calibrate buttons while a run is in flight — v2
+        # worker uses a process-global stdout redirect, so concurrent
+        # runs (v1 or v2) would collide.
+        self.calibrate_v2_btn.setEnabled(False)
+        try:
+            self.calibrate_btn.setEnabled(False)
+        except AttributeError:
+            pass
+
+        result_holder: dict = {}
+        v1_ref = v1  # for the save-back writer (template arg to write_v1_paramstest)
+
+        # Heartbeat: build_map (called via run_estep during the first E-step)
+        # is verbose=False internally, so the log goes silent for 1–3 min on
+        # first invocation while numba JIT-compiles and the CSR is built.
+        # Reads as "hung" otherwise. Heartbeat auto-disables once the worker
+        # emits its first real progress line.
+        _hb_state = {'start': time.time(), 'saw_progress': False}
+        heartbeat = QtCore.QTimer(dlg)
+        heartbeat.setInterval(10000)  # 10 s
+
+        def _emit_heartbeat():
+            if _hb_state['saw_progress']:
+                heartbeat.stop()
+                return
+            elapsed = time.time() - _hb_state['start']
+            log.appendPlainText(
+                f'  … build_map still running ({elapsed:.0f} s elapsed; '
+                f'2880² first-run cost is typically 1–3 min)')
+
+        def _on_progress(line):
+            _hb_state['saw_progress'] = True
+            heartbeat.stop()
+            log.moveCursor(QtGui.QTextCursor.End)
+            log.insertPlainText(line + '\n')
+            log.moveCursor(QtGui.QTextCursor.End)
+
+        heartbeat.timeout.connect(_emit_heartbeat)
+        heartbeat.start()
+
+        def _on_ok(result):
+            if result_holder.get('cancelled'):
+                log.appendPlainText('--- Cancelled: discarding result ---')
+                return
+            result_holder['result'] = result
+            result_holder['before'] = before
+            log.appendPlainText('\n─── v2 autocalibrate finished ───')
+            try:
+                last = result.history[-1]
+                log.appendPlainText(
+                    f'Final iter {last.iteration}: '
+                    f'strain={last.mean_strain_uE:.2f} µɛ  '
+                    f'(med={last.median_strain_uE:.1f}, '
+                    f'trim5%={last.trim_strain_uE:.1f})  '
+                    f'Lsd={last.Lsd:.2f}  '
+                    f'BC=({last.BC_y:.4f}, {last.BC_z:.4f})')
+                # Best iter (by trim5% by default) — this is what Apply /
+                # Save will use. In asymmetric geometries the last iter is
+                # sometimes worse than an earlier one; showing both makes
+                # the guardrail visible instead of magic.
+                best_i = getattr(result, 'best_iter', None)
+                best_iter_used = last  # what Apply/Save will actually use
+                if best_i is not None and 0 <= best_i < len(result.history):
+                    best = result.history[best_i]
+                    metric = getattr(result, 'best_metric', 'trim_strain_uE')
+                    if best_i == last.iteration:
+                        log.appendPlainText(
+                            f'Best iter {best_i} == final; '
+                            f'Apply / Save will use these values '
+                            f'(ranked by {metric}).')
+                    else:
+                        best_iter_used = best
+                        log.appendPlainText(
+                            f'Best iter {best_i}: '
+                            f'strain={best.mean_strain_uE:.2f} µɛ  '
+                            f'(med={best.median_strain_uE:.1f}, '
+                            f'trim5%={best.trim_strain_uE:.1f})  '
+                            f'Lsd={best.Lsd:.2f}  '
+                            f'BC=({best.BC_y:.4f}, {best.BC_z:.4f})  '
+                            f'← Apply / Save will use these (ranked by {metric})')
+
+                # ── Convergence table ── one row per outer iter, showing
+                # how the strain descended. First iter is the E-step-only
+                # residual at the seed geometry; subsequent iters include
+                # the LM step. Useful diagnostic for "did the fit converge
+                # smoothly or oscillate/plateau?"
+                log.appendPlainText('\n─── Pseudo-strain convergence ───')
+                log.appendPlainText(
+                    f'  {"iter":>4}  {"n_fits":>6}  '
+                    f'{"mean µɛ":>10}  {"med µɛ":>9}  '
+                    f'{"trim5% µɛ":>10}  {"cost":>10}  {"rc":>3}')
+                for h in result.history:
+                    marker = ''
+                    if h.iteration == getattr(result, 'best_iter', last.iteration):
+                        marker = '  ← best'
+                    log.appendPlainText(
+                        f'  {h.iteration:>4}  {h.n_fitted:>6}  '
+                        f'{h.mean_strain_uE:>10.2f}  '
+                        f'{h.median_strain_uE:>9.1f}  '
+                        f'{h.trim_strain_uE:>10.1f}  '
+                        f'{h.cost:>10.3g}  {h.rc:>3d}{marker}')
+
+                # Post-residual (after applying the residual-corr map, if
+                # v2 built one). We disable build_residual_corr in the
+                # worker so this is normally None — show it only when set.
+                pr = getattr(result, 'post_residual_strain_uE', None)
+                if pr is not None:
+                    log.appendPlainText(
+                        f'  Post-residual (with corr map): {pr:.2f} µɛ')
+
+                # ── Before / After table ── seed vs refined values for
+                # every panel-visible parameter, with delta. Makes it
+                # trivially visible whether a refined value drifted way
+                # out of the ± margin band (a common calibration
+                # pathology when the seed is bad).
+                unp = result.unpacked
+                def _val(key):
+                    if key not in unp:
+                        return None
+                    v = unp[key]
+                    try:
+                        if hasattr(v, 'detach'):
+                            v = v.detach().cpu().item()
+                        return float(v)
+                    except (TypeError, ValueError, RuntimeError):
+                        return None
+                pairs = [
+                    ('Lsd (µm)',  before.get('Lsd'),        _val('Lsd')),
+                    ('BC_Y (px)', before.get('BC_y'),       _val('BC_y')),
+                    ('BC_Z (px)', before.get('BC_z'),       _val('BC_z')),
+                    ('Ty (°)',    before.get('ty'),         _val('ty')),
+                    ('Tz (°)',    before.get('tz'),         _val('tz')),
+                    ('p0',        before.get('p0'),         _val('p0')),
+                    ('p1',        before.get('p1'),         _val('p1')),
+                    ('p2',        before.get('p2'),         _val('p2')),
+                    ('p3 (°)',    before.get('p3'),         _val('p3')),
+                    ('Wavelength (Å)', before.get('Wavelength'), _val('Wavelength')),
+                ]
+                log.appendPlainText('\n─── Seed → Refined ───')
+                log.appendPlainText(
+                    f'  {"parameter":<15}  {"seed":>14}  '
+                    f'{"refined":>14}  {"Δ":>14}')
+                for name, seed, refined in pairs:
+                    if seed is None and refined is None:
+                        continue
+                    if seed is None:
+                        seed_s = '—'
+                        delta_s = '—'
+                    elif refined is None:
+                        seed_s = f'{seed:14.6g}'
+                        delta_s = '—'
+                    else:
+                        seed_s = f'{seed:14.6g}'
+                        delta = refined - seed
+                        delta_s = f'{delta:+14.6g}'
+                    refined_s = f'{refined:14.6g}' if refined is not None else '—'
+                    log.appendPlainText(
+                        f'  {name:<15}  {seed_s}  {refined_s}  {delta_s}')
+
+                # Persist the strain on the viewer so the Rings tab
+                # status label can show it after this dialog closes.
+                self._last_calib_strain_uE = float(best_iter_used.mean_strain_uE)
+                self._last_calib_source = 'v2 autocalibrate'
+                self._refresh_rings_status()
+            except (AttributeError, IndexError):
+                pass
+            close_btn.setEnabled(True)
+            apply_btn.setEnabled(True)
+            save_btn.setEnabled(True)
+            cancel_btn.setEnabled(False)
+
+        def _on_fail(msg):
+            heartbeat.stop()
+            log.appendPlainText(f'\n*** v2 autocalibrate FAILED ***\n{msg}')
+            close_btn.setEnabled(True)
+            cancel_btn.setEnabled(False)
+
+        def _on_apply():
+            r = result_holder.get('result')
+            if r is None:
+                return
+            self._apply_v2_refined_params(r, before=before)
+            apply_btn.setEnabled(False)
+            log.appendPlainText('Applied refined values to Detector Rings panel.')
+
+        def _on_save():
+            r = result_holder.get('result')
+            if r is None:
+                return
+            default = os.path.join(
+                self.folder.rstrip('/') if self.folder else os.getcwd(),
+                f'ps_refined_v2_{self.file_stem or "ff"}.txt')
+            fn, _ = QtWidgets.QFileDialog.getSaveFileName(
+                dlg, "Save refined ps.txt (v2)", default,
+                "MIDAS param files (*.txt);;All files (*)")
+            if not fn:
+                return
+            try:
+                # Prefer the best iter's snapshot (guardrail); fall back to
+                # the last iter's unpacked dict for old results that lack it.
+                unp = getattr(r, 'best_unpacked', None) or r.unpacked
+                write_v1_paramstest_v2(unp, template=v1_ref, path=fn)
+                log.appendPlainText(f'Wrote refined ps.txt to: {fn}')
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(
+                    dlg, "Save refined ps.txt",
+                    f"Write failed:\n{e}")
+
+        def _on_cancel():
+            # v2 has no native cancel; the thread completes its current
+            # LM step then finishes. We flag the result as discarded so
+            # _on_ok drops it instead of enabling Apply.
+            result_holder['cancelled'] = True
+            cancel_btn.setEnabled(False)
+            close_btn.setEnabled(True)
+            log.appendPlainText(
+                '\n--- Cancel requested. Waiting for current iteration to '
+                'finish, then discarding result. ---')
+
+        # Pre-flight status banner in the log dialog. Populates before
+        # the worker starts so the user sees the seed + integrator setup
+        # instead of a blank pane during the (potentially long) first
+        # build_map call. Uses the same log widget the worker will feed
+        # into once its progress signals fire.
+        def _fmt(v, spec='{:g}'):
+            return spec.format(v) if v is not None else '—'
+
+        def _read_edit_float(edit_attr, default=0.0):
+            try:
+                return float(getattr(self, edit_attr).text())
+            except (ValueError, AttributeError):
+                return default
+
+        def _read_tol(refine_key):
+            ed = self._refine_tols.get(refine_key)
+            if ed is None:
+                return None
+            try:
+                return float(ed.text())
+            except (ValueError, AttributeError):
+                return None
+
+        rings_str = ', '.join(f'{r/px_um:.0f}' for r in self.ring_rads if r) or '—'
+
+        # Per-parameter rows: value (with unit) + refine/freeze + tol.
+        # Widths chosen so the ✓/· column aligns across rows.
+        # tx isn't in `before` (not on v1_params by design — never refined);
+        # read it directly from the tx_edit.
+        tx_val = _read_edit_float('tx_edit', 0.0)
+        # (label, refine_key, value, value_fmt, unit)
+        param_rows = [
+            ('Lsd',     'Lsd',  before['Lsd'],  '{:.2f}',   'µm'),
+            ('BC_Y',    'BC_Y', before['BC_y'], '{:.4f}',   'px'),
+            ('BC_Z',    'BC_Z', before['BC_z'], '{:.4f}',   'px'),
+            ('Tx',      'Tx',   tx_val,         '{:.4f}',   '°'),
+            ('Ty',      'Ty',   before['ty'],   '{:.4f}',   '°'),
+            ('Tz',      'Tz',   before['tz'],   '{:.4f}',   '°'),
+            ('p0',      'p0',   before['p0'],   '{:g}',     ''),
+            ('p1',      'p1',   before['p1'],   '{:g}',     ''),
+            ('p2',      'p2',   before['p2'],   '{:g}',     ''),
+            ('p3',      'p3',   before['p3'],   '{:g}',     '°'),
+        ]
+
+        banner_lines = ['─── Seed geometry + refine flags (from ± margin > 0) ───']
+        for label, refine_key, val, val_fmt, unit in param_rows:
+            val_str = _fmt(val, val_fmt) if val is not None else '—'
+            unit_str = f' {unit}' if unit else ''
+            value_col = f'{val_str}{unit_str}'
+            cb = self._refine_checks.get(refine_key)
+            checked = cb.isChecked() if cb is not None else False
+            tol = _read_tol(refine_key)
+            if checked and tol is not None:
+                status = f'✓ refine (± {tol:g})'
+            elif checked:
+                status = '✓ refine'
+            else:
+                status = '· freeze'
+            # Label 10 chars, value column 24 chars, then status
+            banner_lines.append(f'  {label:<10} : {value_col:<24} {status}')
+        # Non-refinable-in-panel context values.
+        banner_lines.extend([
+            f'  {"Wavelength":<10} : {_fmt(before["Wavelength"], "{:.6f}"):<24} '
+            f'(fixed from Energy field)',
+            f'  {"Pixel size":<10} : {f"{px_um:g} µm":<24} '
+            f'Detector: {int(self.ny)}×{int(self.nz)}',
+            '─── Cake integrator (v2 defaults) ───',
+            f'  RMin/RMax   : {float(v1.RMin):.1f} / {float(v1.RMax):.1f} px',
+            f'  RBinSize    : {float(v1.RBinSize):g} px',
+            f'  EtaBinSize  : {float(v1.EtaBinSize):g}°',
+            f'  n_r_bins    : ~{int((float(v1.RMax) - float(v1.RMin)) / float(v1.RBinSize))}',
+            f'  Ring rads   : [{rings_str}] px',
+            '─── Running autocalibrate — first build_map is quiet '
+            '(1–3 min on 2880²; numba JIT + CSR build). Heartbeat every 10 s. ───',
+        ])
+        log.appendPlainText('\n'.join(banner_lines))
+        log.appendPlainText('')  # blank line before worker output
+
+        worker = _CalibrateV2Worker(v1, image, dark=None, spec=spec, parent=self)
+        worker.progress.connect(_on_progress)
+        worker.succeeded.connect(_on_ok)
+        worker.failed.connect(_on_fail)
+        cancel_btn.clicked.connect(_on_cancel)
+        close_btn.clicked.connect(dlg.accept)
+        apply_btn.clicked.connect(_on_apply)
+        save_btn.clicked.connect(_on_save)
+
+        # Prevent GC while running.
+        self._calib_v2_worker = worker
+        worker.start()
+        try:
+            dlg.exec_()
+        finally:
+            # Re-enable buttons even if the user X'd the dialog mid-run.
+            try:
+                self.calibrate_v2_btn.setEnabled(True)
+            except AttributeError:
+                pass
+            try:
+                self.calibrate_btn.setEnabled(True)
+            except AttributeError:
+                pass
+
+    # Refined |Ty| or |Tz| beyond this bound is almost always a runaway —
+    # optimizer found a nonphysical tilt basin that compensates for a bad
+    # BC seed. Real 1-ID Varex / Eiger / Pilatus mounts are within ~1°.
+    TILT_SANITY_DEG = 3.0
+
+    def _apply_v2_refined_params(self, result, before=None):
+        """Push refined v2 params into the Detector Rings QLineEdits and
+        redraw. Mirrors _apply_bc_lsd_from_fit but covers the full
+        parameter set (Lsd, BC, ty/tz, p0..p3, Wavelength)."""
+        # Best-iter snapshot (guardrail); fall back to the last iter's
+        # unpacked dict on older results that lack best_unpacked.
+        unp = getattr(result, 'best_unpacked', None) or result.unpacked
+
+        # Sanity-check refined tilts before pushing them. Runaway calibrations
+        # land in the |Tz| ~ 13-15° basin — the user has to notice and roll
+        # back manually. Catch it here and require explicit override.
+        def _tilt_val(key):
+            v = unp.get(key)
+            if v is None:
+                return 0.0
+            try:
+                return float(v.detach().cpu().item() if hasattr(v, 'detach') else v)
+            except (TypeError, ValueError, RuntimeError):
+                return 0.0
+        ty_ref = _tilt_val('ty')
+        tz_ref = _tilt_val('tz')
+        if abs(ty_ref) > self.TILT_SANITY_DEG or abs(tz_ref) > self.TILT_SANITY_DEG:
+            msg = (f"Refined tilts look nonphysical:\n\n"
+                   f"    Ty = {ty_ref:+.4f}°\n"
+                   f"    Tz = {tz_ref:+.4f}°\n\n"
+                   f"Real detector mounts are typically within "
+                   f"±{self.TILT_SANITY_DEG:g}°. This usually means the "
+                   f"refinement ran away — the seed BC was off enough that "
+                   f"the optimizer traded huge tilt for a fake BC fit.\n\n"
+                   f"Recommended: click No, use the Zero tilts button to "
+                   f"reset Ty/Tz, then rerun calibration with tilts frozen.\n\n"
+                   f"Apply anyway?")
+            reply = QtWidgets.QMessageBox.warning(
+                self, "Calibrate (v2) — tilt sanity check", msg,
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if reply != QtWidgets.QMessageBox.Yes:
+                try:
+                    self.status_label.setText(
+                        f"Refinement rejected (Ty={ty_ref:+.3f}°, "
+                        f"Tz={tz_ref:+.3f}° > ±{self.TILT_SANITY_DEG:g}°). "
+                        f"Try Zero tilts and rerun.")
+                except AttributeError:
+                    pass
+                return
+
+        def _val(key):
+            if key not in unp:
+                return None
+            v = unp[key]
+            try:
+                if hasattr(v, 'detach'):
+                    v = v.detach().cpu().item()
+                return float(v)
+            except (TypeError, ValueError, RuntimeError):
+                return None
+
+        def _push(edit_attr, key, fmt='{:g}'):
+            v = _val(key)
+            if v is None:
+                return
+            try:
+                getattr(self, edit_attr).setText(fmt.format(v))
+            except AttributeError:
+                pass
+
+        _push('lsd_edit', 'Lsd', '{:.2f}')
+        _push('bcy_edit', 'BC_y', '{:.4f}')
+        _push('bcz_edit', 'BC_z', '{:.4f}')
+        _push('ty_edit', 'ty')
+        _push('tz_edit', 'tz')
+        _push('p0_edit', 'p0')
+        _push('p1_edit', 'p1')
+        _push('p2_edit', 'p2')
+        _push('p3_edit', 'p3')
+
+        # Sync mirror attributes read by _apply_param_file / _draw_rings.
+        bcy_v = _val('BC_y'); bcz_v = _val('BC_z')
+        if bcy_v is not None and bcz_v is not None:
+            self.bc_local = [bcy_v, bcz_v]
+        lsd_v = _val('Lsd')
+        if lsd_v is not None:
+            self.lsd_local = lsd_v
+            self.lsd_orig = lsd_v
+        wl_v = _val('Wavelength')
+        if wl_v is not None and wl_v > 0:
+            self.wl = wl_v
+            self._sync_energy_field()
+
+        self._redraw_if_rings()
+
     def _redraw_if_rings(self):
         if self.show_rings and self.ring_rads:
             self._draw_rings()
@@ -5288,9 +6426,19 @@ class FFViewer(QtWidgets.QMainWindow):
         if e_kev <= 0:
             return
         wl_new = 12.398 / e_kev   # Å
-        # If we don't have cached d-spacings yet (rings never generated),
-        # nothing to rescale — just remember the new wl.
+        # If we don't have cached d-spacings yet, but we DO have rings
+        # and a valid wl+lsd, self-heal the cache from current state.
+        # This covers ring_rads coming from a param-file load or session
+        # restore — those paths bypass _on_ring_selection so
+        # _cache_ring_dspacings was never called. Cache is populated
+        # using the CURRENT self.wl (still the old wl at this point,
+        # not wl_new) so the d-spacings are physically correct before
+        # we rescale.
         if not getattr(self, '_ring_ds', None):
+            if self.ring_rads and self.wl and self.lsd_local:
+                self._cache_ring_dspacings()
+        if not getattr(self, '_ring_ds', None):
+            # Still empty — no rings loaded yet. Just remember the new wl.
             self.wl = wl_new
             return
         try:
@@ -5311,6 +6459,7 @@ class FFViewer(QtWidgets.QMainWindow):
         self.ring_rads = new_rads
         self.wl = wl_new
         self._redraw_if_rings()
+        self._refresh_rings_status()
 
     # ── Arc-fit BC/Lsd ────────────────────────────────────────────────
     #
@@ -6051,6 +7200,7 @@ class FFViewer(QtWidgets.QMainWindow):
             self._cache_ring_dspacings()
             self.rings_check.setChecked(True)
             self._draw_rings()
+            self._refresh_rings_status()
 
 
     # ── Auto-detect ────────────────────────────────────────────────
@@ -6404,6 +7554,27 @@ class RingSelectionDialog(QtWidgets.QDialog):
     def _build_material_page(self):
         lay = QtWidgets.QFormLayout(self)
 
+        # Force a state sync so the dialog reads whatever the user just
+        # typed on the panel (Pixel Size, Lsd, Wavelength/Energy, etc.)
+        # rather than stale Python state. Same principle we applied to
+        # _build_full_calibration_ps_txt — panel edits are the truth,
+        # self.viewer.* attributes are just cached copies that only
+        # refresh via _sync_params / editingFinished handlers.
+        try:
+            self.viewer._sync_params()
+        except Exception:
+            pass
+        # Wavelength lives on self.wl and is updated by _on_energy_edited
+        # (editingFinished on energy_edit), but if focus is still on the
+        # energy field when the dialog is opened, editingFinished may not
+        # have fired yet. Belt-and-suspenders: re-read the Energy edit.
+        try:
+            e_kev = float(self.viewer.energy_edit.text())
+            if e_kev > 0:
+                self.viewer.wl = 12.398 / e_kev
+        except (ValueError, AttributeError):
+            pass
+
         # ── Material preset dropdown ──
         self.material_combo = QtWidgets.QComboBox()
         for name, _sg, _lat, _ds in self._MATERIAL_PRESETS:
@@ -6416,8 +7587,6 @@ class RingSelectionDialog(QtWidgets.QDialog):
         lay.addRow("Material:", self.material_combo)
 
         self.sg_edit = QtWidgets.QLineEdit(str(self.viewer.sg))
-        self.wl_edit = QtWidgets.QLineEdit(str(self.viewer.wl))
-        self.px_edit = QtWidgets.QLineEdit(str(self.viewer.pixel_size))
         self.lsd_edit = QtWidgets.QLineEdit(str(self.viewer.lsd_local))
         self.maxrad_edit = QtWidgets.QLineEdit(str(self.viewer.temp_max_ring_rad))
         self.lc_edits = []
@@ -6435,17 +7604,48 @@ class RingSelectionDialog(QtWidgets.QDialog):
             "SpaceGroup/Lattice fields above are ignored. Useful for SAXS\n"
             "calibrants like silver behenate (AgBe).")
 
+        # Read-only info banner: shows the instrument-level values
+        # (Energy / Wavelength / Pixel size) this dialog will use. They
+        # come from the Calibration and Image/Display tabs; edit them
+        # there, not here. Removing the redundant edit widgets means the
+        # dialog can't drift from panel state.
+        info_lines = []
+        try:
+            wl = float(self.viewer.wl) if self.viewer.wl else 0.0
+            if wl > 0:
+                info_lines.append(
+                    f"Energy: {12.398 / wl:.4f} keV   "
+                    f"Wavelength: {wl:.6f} Å")
+            else:
+                info_lines.append("Energy: — (set on Calibration tab)")
+        except (TypeError, ValueError, ZeroDivisionError):
+            info_lines.append("Energy: — (set on Calibration tab)")
+        try:
+            px_um = float(self.viewer.pixel_size)
+            info_lines.append(
+                f"Pixel size: {px_um:g} µm (set on Image / Display tab)")
+        except (TypeError, ValueError):
+            info_lines.append("Pixel size: — (set on Image / Display tab)")
+        info_lbl = QtWidgets.QLabel('    '.join(info_lines))
+        info_lbl.setStyleSheet(
+            "color: #444; padding: 6px 8px; "
+            "background-color: rgba(200, 200, 200, 40); "
+            "border-radius: 4px;")
+        info_lbl.setWordWrap(True)
+
+        lay.addRow("Instrument:", info_lbl)
         lay.addRow("SpaceGroup:", self.sg_edit)
-        lay.addRow("Wavelength (Å) or Energy (keV):", self.wl_edit)
         lc_row = QtWidgets.QHBoxLayout()
         for e in self.lc_edits:
-            e.setMinimumWidth(70)
+            # 90 px covers 5.4116 / 10.2500 / 120.000-style values
+            # without clipping even at larger fonts. Was 70 → clipped
+            # to `.4116` on the default width.
+            e.setMinimumWidth(90)
             lc_row.addWidget(e)
         lay.addRow("Lattice Const (Å):", lc_row)
         lay.addRow("d-spacings (Å):", self.dspacings_edit)
         lay.addRow("Lsd (μm):", self.lsd_edit)
         lay.addRow("MaxRingRad (μm):", self.maxrad_edit)
-        lay.addRow("Pixel Size (μm):", self.px_edit)
 
         btn = QtWidgets.QPushButton("Generate Rings")
         btn.clicked.connect(self._generate_and_select)
@@ -6490,12 +7690,20 @@ class RingSelectionDialog(QtWidgets.QDialog):
         return out
 
     def _generate_and_select(self):
-        # Write temp param file and run GetHKLList
-        wl = float(self.wl_edit.text())
-        if wl > 1:
-            wl = 12.398 / wl
-        self.viewer.wl = wl
-        self.viewer.pixel_size = float(self.px_edit.text())
+        # Instrument-level params (wavelength, pixel size) come from the
+        # viewer state — set on the Calibration / Image-Display tabs, not
+        # in this dialog. _build_material_page ran _sync_params +
+        # re-read energy_edit at dialog open, so self.viewer.wl and
+        # self.viewer.pixel_size reflect whatever's currently on those
+        # panels.
+        wl = float(self.viewer.wl) if self.viewer.wl else 0.0
+        if wl <= 0:
+            QtWidgets.QMessageBox.warning(
+                self, "Ring Material",
+                "No wavelength set. Enter Energy (keV) on the Calibration "
+                "tab before generating rings.")
+            return
+        # px_um kept on viewer.pixel_size — no dialog-side mutation.
         self.viewer.lsd_local = float(self.lsd_edit.text())
         self.viewer.lsd_orig = self.viewer.lsd_local
         self.viewer.temp_max_ring_rad = float(self.maxrad_edit.text())
