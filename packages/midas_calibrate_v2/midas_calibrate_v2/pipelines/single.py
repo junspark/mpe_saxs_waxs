@@ -55,6 +55,14 @@ class CalibrationResult:
     # dg_residual_corr_lookup).  None when ``build_residual_corr=False``.
     residual_corr_map: Optional[torch.Tensor] = None
     post_residual_strain_uE: Optional[float] = None
+    # Best-iteration bookkeeping. In asymmetric geometries the outer E↔M
+    # loop can walk into a worse iteration after finding a good one; these
+    # let the caller apply the geometry from the best iter instead of the
+    # last. best_metric names the IterRecord field used to rank; the GUI
+    # displays this so users know what "best" means for this run.
+    best_iter: Optional[int] = None
+    best_metric: str = ""
+    best_unpacked: Optional[dict] = None
 
 
 def autocalibrate(
@@ -71,6 +79,9 @@ def autocalibrate(
     build_residual_corr: bool = True,
     residual_corr_outlier_pct: float = 90.0,
     residual_corr_path: Optional[str] = None,
+    best_metric: str = "trim",
+    divergence_ratio: float = 1.05,
+    divergence_streak: int = 2,
 ) -> CalibrationResult:
     """Run alternating E↔M with the v2 spec.
 
@@ -106,6 +117,24 @@ def autocalibrate(
     history: List[IterRecord] = []
     fits_final: Optional[FittedDataset] = None
     unpacked = None
+
+    # Best-iter tracking. Alternating E↔M can visit a good iter and then
+    # walk to a worse one when the E-step re-classifies borderline peaks;
+    # remember the best geometry seen and hand it back at the end.
+    metric_field = {
+        "trim":   "trim_strain_uE",
+        "median": "median_strain_uE",
+        "mean":   "mean_strain_uE",
+    }.get(best_metric, "trim_strain_uE")
+    _score = lambda rec: getattr(rec, metric_field)
+    best_idx: Optional[int] = None
+    best_unpacked_snapshot: Optional[dict] = None
+    divergent_count = 0
+
+    def _snapshot(unp: dict) -> dict:
+        # detach + clone so later in-place updates in v1_params/M-step
+        # can't mutate what we've frozen for "best".
+        return {k: v.detach().clone() for k, v in unp.items()}
 
     for it in range(n_iter):
         # E-step (v1, proven).  Uses current v1_params geometry.
@@ -170,18 +199,43 @@ def autocalibrate(
         history.append(rec)
         fits_final = fits
         if verbose:
+            tag = ''
+            if best_idx is None or _score(rec) < _score(history[best_idx]):
+                tag = '  ← best'
             print(f"[v2 iter {it}] n_fits={rec.n_fitted:4d}  rc={rc}  "
                   f"strain={mean_strain_uE:8.1f}μϵ "
                   f"(med={median_strain_uE:6.1f}, trim5%={trim_strain_uE:6.1f})  "
                   f"Lsd={rec.Lsd:.2f}  BC=({rec.BC_y:.3f},{rec.BC_z:.3f})  "
-                  f"ty={rec.ty:.4f}  tz={rec.tz:.4f}")
+                  f"ty={rec.ty:.4f}  tz={rec.tz:.4f}{tag}")
+
+        # Best-iter update. Snapshot unpacked so a later worse iter doesn't
+        # mutate what we hand back.
+        if best_idx is None or _score(rec) < _score(history[best_idx]):
+            best_idx = len(history) - 1
+            best_unpacked_snapshot = _snapshot(unpacked)
+            divergent_count = 0
+        else:
+            # Only flag divergence when this iter is meaningfully worse
+            # than the running best (>divergence_ratio). One-iter blips
+            # within the ratio don't count.
+            if _score(rec) > divergence_ratio * _score(history[best_idx]):
+                divergent_count += 1
+                if divergent_count >= divergence_streak:
+                    if verbose:
+                        print(f"[v2] diverging — halting after iter {it} "
+                              f"({metric_field}={_score(rec):.1f}μϵ > "
+                              f"{divergence_ratio:.2f}× best iter {best_idx}); "
+                              f"returning best iter's geometry")
+                    break
+            else:
+                divergent_count = 0
 
         if len(history) >= 2:
-            prev = history[-2].mean_strain_uE
-            cur_ms = history[-1].mean_strain_uE
+            prev = _score(history[-2])
+            cur_ms = _score(history[-1])
             if cur_ms < 1.0 or abs(prev - cur_ms) < 0.01 * max(prev, 1.0):
                 if verbose:
-                    print(f"[v2 iter {it}] converged")
+                    print(f"[v2 iter {it}] converged ({metric_field})")
                 break
 
     # ---- Post-MAP empirical residual-correction map (v1 parity stage).
@@ -279,7 +333,10 @@ def autocalibrate(
     return CalibrationResult(spec=spec, unpacked=unpacked or {},
                               history=history, fits_final=fits_final,
                               residual_corr_map=residual_map,
-                              post_residual_strain_uE=post_strain)
+                              post_residual_strain_uE=post_strain,
+                              best_iter=best_idx,
+                              best_metric=metric_field,
+                              best_unpacked=best_unpacked_snapshot)
 
 
 __all__ = ["IterRecord", "CalibrationResult", "autocalibrate"]
