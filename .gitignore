@@ -47,6 +47,7 @@ utils/__pycache__
 */*/__pycache__
 .vscode
 .DS_Store
+Thumbs.db
 build
 
 # Build artifacts
