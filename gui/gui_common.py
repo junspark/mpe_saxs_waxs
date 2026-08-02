@@ -599,6 +599,24 @@ class MIDASImageView(QtWidgets.QWidget):
         self._vline.setVisible(visible)
         self._hline.setVisible(visible)
 
+    def set_histogram_width(self, width):
+        """Cap the histogram/colorbar column's width (pixels).
+
+        Opt-in only — default ImageView sizing is unchanged unless a
+        caller wants a narrower colorbar, e.g. side-by-side comparison
+        panels where image area matters more than the LUT strip."""
+        hist = getattr(getattr(self._iv, 'ui', None), 'histogram', None)
+        if hist is not None:
+            hist.setMaximumWidth(width)
+
+    def set_nav_bar_visible(self, visible):
+        """Show or hide the playback/navigation toolbar row.
+
+        Opt-in only — default ImageView layout is unchanged unless a
+        caller wants a bare image + histogram, e.g. compact comparison
+        panels where the home/pan/zoom/movie controls are unused."""
+        self._nav_bar.setVisible(visible)
+
     def setLevels(self, lo, hi):
         """Set intensity levels (accepts linear-space values) and zoom the
         histogram axis to match.
