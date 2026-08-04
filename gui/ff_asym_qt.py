@@ -11,7 +11,7 @@ import os
 import math
 import tempfile
 import time
-from typing import Optional
+from typing import Optional, Tuple
 import subprocess
 import threading
 import shutil
@@ -5293,6 +5293,59 @@ class FFViewer(QtWidgets.QMainWindow):
         lines.append(f'tolP3 {_tol("p3")}')
         return '\n'.join(lines) + '\n'
 
+    def _detect_actual_file_shape(self, fn) -> Optional[Tuple[int, int]]:
+        """Read-only probe of a data file's real (ny, nz) pixel shape.
+
+        Used to validate against the GUI's declared NrPixelsY/NrPixelsZ
+        before launching CalibrantIntegratorOMP, which sizes its read
+        buffer from the declared shape but trusts the file's own header
+        for how much to write — a mismatch (e.g. after loading a saved
+        param file with 'Instr. only' checked while a different-shaped
+        detector's data is open) overflows that buffer and segfaults.
+        Returns None when the shape can't be determined (raw binaries,
+        zarr-zip, unsupported format) — callers should skip validation
+        rather than block a run they can't verify."""
+        ext_lower = os.path.splitext(fn)[1].lower()
+        try:
+            if ext_lower in ('.tif', '.tiff') and tifffile is not None:
+                with tifffile.TiffFile(fn) as tf:
+                    if not tf.pages:
+                        return None
+                    shape = tf.pages[0].shape
+                    if len(shape) >= 2:
+                        return int(shape[0]), int(shape[1])
+            elif ext_lower in ('.h5', '.hdf', '.hdf5', '.nxs') and h5py:
+                with h5py.File(fn, 'r') as f:
+                    dpath = self.hdf5_data_path
+                    if dpath in f:
+                        shape = f[dpath].shape
+                        if len(shape) == 3:
+                            return int(shape[1]), int(shape[2])
+                        elif len(shape) == 2:
+                            return int(shape[0]), int(shape[1])
+        except Exception as e:
+            print(f"Shape validation probe failed: {e}")
+        return None
+
+    def _detect_tiff_dtype(self, fn) -> Optional[str]:
+        """Read-only probe of a TIFF file's pixel dtype (e.g. 'uint8').
+
+        CalibrantIntegratorOMP always reads MaskFile with a hardcoded
+        dType=7 (uint8, 1=bad) regardless of the file's real bit depth
+        (FileReader.c skips format auto-detection for dType==7). A 16-bit
+        mask is read as if it were half as many uint8 pixels per row,
+        overflowing the read buffer. Returns None if undeterminable."""
+        if tifffile is None:
+            return None
+        try:
+            with tifffile.TiffFile(fn) as tf:
+                if not tf.pages:
+                    return None
+                return str(tf.pages[0].dtype)
+        except Exception as e:
+            print(f"Mask dtype probe failed: {e}")
+            return None
+
     def _current_data_file(self) -> Optional[str]:
         """Best-effort path to the currently displayed data file."""
         if getattr(self, 'zarr_zip_path', None):
@@ -5337,7 +5390,23 @@ class FFViewer(QtWidgets.QMainWindow):
         except (ValueError, AttributeError):
             pass
         data_fn = self._current_data_file()
+        self._calibration_prereq_error = None
         if not data_fn:
+            return None
+        actual_shape = self._detect_actual_file_shape(data_fn)
+        declared_shape = (int(self.ny), int(self.nz))
+        if actual_shape is not None and actual_shape != declared_shape:
+            self._calibration_prereq_error = (
+                "Detector shape mismatch: ps.txt would declare "
+                f"{declared_shape[0]}×{declared_shape[1]} px, but the "
+                f"data file on disk ({os.path.basename(data_fn)}) is "
+                f"actually {actual_shape[0]}×{actual_shape[1]} px.\n\n"
+                "This usually happens after loading a saved param file "
+                "with 'Instr. only' checked while a different-shaped "
+                "detector's data is open. Launching CalibrantIntegratorOMP "
+                "with mismatched dimensions will crash.\n\n"
+                "Re-load the data file, or correct Pixels H/V, before "
+                "calibrating.")
             return None
         if not self.wl:
             return None
@@ -5373,6 +5442,17 @@ class FFViewer(QtWidgets.QMainWindow):
         lines.append(f'StartNr {int(self.first_file_nr)}')
         lines.append(f'EndNr {int(self.first_file_nr)}')
         if self.dark_fn:
+            dark_shape = self._detect_actual_file_shape(self.dark_fn)
+            if dark_shape is not None and dark_shape != declared_shape:
+                self._calibration_prereq_error = (
+                    "Detector shape mismatch: ps.txt would declare "
+                    f"{declared_shape[0]}×{declared_shape[1]} px, but the "
+                    f"dark file ({os.path.basename(self.dark_fn)}) is "
+                    f"actually {dark_shape[0]}×{dark_shape[1]} px.\n\n"
+                    "A stale dark file left over from a different-shaped "
+                    "detector will crash CalibrantIntegratorOMP. Re-select "
+                    "the dark file, or clear it, before calibrating.")
+                return None
             lines.append(f'Dark {self.dark_fn}')
         lines.append(f'NrPixelsY {int(self.ny)}')
         lines.append(f'NrPixelsZ {int(self.nz)}')
@@ -5467,6 +5547,27 @@ class FFViewer(QtWidgets.QMainWindow):
         if getattr(self, 'apply_mask', False) and self.mask_edit.text():
             mask_path = self.mask_edit.text().strip()
             if mask_path and os.path.exists(mask_path):
+                mask_shape = self._detect_actual_file_shape(mask_path)
+                mask_dtype = self._detect_tiff_dtype(mask_path)
+                if mask_shape is not None and mask_shape != declared_shape:
+                    self._calibration_prereq_error = (
+                        "Detector shape mismatch: ps.txt would declare "
+                        f"{declared_shape[0]}×{declared_shape[1]} px, but "
+                        f"the mask file ({os.path.basename(mask_path)}) is "
+                        f"actually {mask_shape[0]}×{mask_shape[1]} px.\n\n"
+                        "A mismatched mask will crash CalibrantIntegratorOMP. "
+                        "Re-select the mask, or clear it, before calibrating.")
+                    return None
+                if mask_dtype is not None and mask_dtype != 'uint8':
+                    self._calibration_prereq_error = (
+                        f"Mask file ({os.path.basename(mask_path)}) is "
+                        f"{mask_dtype}, but CalibrantIntegratorOMP always "
+                        "reads MaskFile as uint8 (1=bad) regardless of the "
+                        "file's real bit depth. A non-uint8 mask overflows "
+                        "its read buffer and crashes.\n\n"
+                        "Convert the mask to an 8-bit TIFF, or clear it, "
+                        "before calibrating.")
+                    return None
                 lines.append(f'MaskFile {mask_path}')
         # Value-based masks: any pixel matching these is treated as bad.
         bad_px = getattr(self, 'bad_px_intensity', None)
@@ -5687,6 +5788,7 @@ class FFViewer(QtWidgets.QMainWindow):
         if content is None:
             QtWidgets.QMessageBox.warning(
                 self, "Calibrate",
+                getattr(self, '_calibration_prereq_error', None) or
                 "Missing prerequisites for MIDAS calibration. Need:\n"
                 "  • a loaded data file\n"
                 "  • a wavelength (set Energy on Detector Rings)\n"
@@ -5885,6 +5987,7 @@ class FFViewer(QtWidgets.QMainWindow):
         if content is None:
             QtWidgets.QMessageBox.warning(
                 self, "Calibrate (v2)",
+                getattr(self, '_calibration_prereq_error', None) or
                 "Missing prerequisites for calibration. Need:\n"
                 "  • a loaded data file\n"
                 "  • a wavelength (set Energy on Detector Rings)\n"
