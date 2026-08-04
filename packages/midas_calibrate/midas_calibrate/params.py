@@ -76,6 +76,14 @@ class CalibrationParams:
     tolLsd: float = 15000.0   # μm
     tolBC: float = 20.0       # px
     tolTilts: float = 3.0     # deg
+    # Per-axis tilt tolerances, v2-only. The C binary (CalibrantIntegratorOMP)
+    # only understands the single combined `tolTilts` key, so ty/tz always
+    # refine within the same ± window there. v2's LM has no such constraint;
+    # when these are present in the ps.txt they override tolTilts for their
+    # respective axis. None means "not specified — fall back to tolTilts",
+    # distinct from an explicit 0 (frozen).
+    tolTy: Optional[float] = None   # deg
+    tolTz: Optional[float] = None   # deg
     tolDistortion: float = 0.01
     tolWavelength: float = 0.001    # Å
     tolParallax: float = 50.0       # μm
@@ -160,6 +168,10 @@ class CalibrationParams:
                 params.tolBC = float(val.split()[0])
             elif key == "tolTilts":
                 params.tolTilts = float(val.split()[0])
+            elif key == "tolTy":
+                params.tolTy = float(val.split()[0])
+            elif key == "tolTz":
+                params.tolTz = float(val.split()[0])
             elif key == "tolDistortion":
                 params.tolDistortion = float(val.split()[0])
             elif key == "tolWavelength":

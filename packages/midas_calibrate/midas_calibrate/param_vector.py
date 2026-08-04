@@ -60,8 +60,13 @@ def bounds(params: CalibrationParams, dtype=torch.float64, device="cpu") -> Tupl
     hi[0] = params.Lsd + params.tolLsd
     lo[1] = params.BC_y - params.tolBC; hi[1] = params.BC_y + params.tolBC
     lo[2] = params.BC_z - params.tolBC; hi[2] = params.BC_z + params.tolBC
-    lo[3] = params.ty - params.tolTilts; hi[3] = params.ty + params.tolTilts
-    lo[4] = params.tz - params.tolTilts; hi[4] = params.tz + params.tolTilts
+    # Independent per-axis tilt tolerance when the ps.txt specifies one
+    # (v2-only — see CalibrationParams.tolTy/tolTz); otherwise fall back to
+    # the shared tolTilts, matching the C binary's single-knob behaviour.
+    tol_ty = params.tolTy if params.tolTy is not None else params.tolTilts
+    tol_tz = params.tolTz if params.tolTz is not None else params.tolTilts
+    lo[3] = params.ty - tol_ty; hi[3] = params.ty + tol_ty
+    lo[4] = params.tz - tol_tz; hi[4] = params.tz + tol_tz
     for i in range(15):
         cur = getattr(params, f"p{i}")
         lo[5 + i] = cur - params.tolDistortion
