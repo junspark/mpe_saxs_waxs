@@ -280,6 +280,7 @@ def extract_fitted_points(
         FittedPoint(
             Y_pix=float(Y_pix[i]), Z_pix=float(Z_pix[i]),
             ring_idx=int(ring_idxs[i]), snr=float(snrs[i]),
+            eta_deg=float(Eta_targets[i]),
         )
         for i in range(R_targets.shape[0])
     ]

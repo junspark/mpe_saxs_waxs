@@ -43,6 +43,13 @@ class IterRecord:
     # are the apples-to-apples numbers vs the C tool.
     median_strain_uE: float = 0.0
     trim_strain_uE: float = 0.0
+    # Per-fitted-point breakdown of this iteration's residual, kept for the
+    # GUI's ring x azimuth heatmap. Signed (not abs) so azimuthal/hkl bias
+    # patterns — e.g. the signature of a tilt/distance mismatch — stay
+    # visible instead of being folded into a magnitude-only view.
+    residuals_uE: Optional[torch.Tensor] = None
+    ring_idx: Optional[torch.Tensor] = None
+    eta_deg: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -195,6 +202,9 @@ def autocalibrate(
             BC_y=float(unpacked["BC_y"]), BC_z=float(unpacked["BC_z"]),
             ty=float(unpacked["ty"]), tz=float(unpacked["tz"]),
             median_strain_uE=median_strain_uE, trim_strain_uE=trim_strain_uE,
+            residuals_uE=(r_final.detach().clone() * 1e6),
+            ring_idx=fits.ring_idx.detach().clone(),
+            eta_deg=(fits.eta_deg.detach().clone() if fits.eta_deg is not None else None),
         )
         history.append(rec)
         fits_final = fits
