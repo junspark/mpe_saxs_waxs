@@ -1403,9 +1403,12 @@ class FFViewer(QtWidgets.QMainWindow):
                     'family — check either to enable both.')
 
         _tilt_family_tip = (
-            'Tx / Ty / Tz refine as a family in MIDAS (single tolTilts '
-            'key). Checking any tilt enables refinement of all three '
-            'with tolTilts = max of the checked tolerances.')
+            'Tx / Ty / Tz refine as a family in Calibrate… (C binary — '
+            'single tolTilts key; checking any tilt enables all three '
+            'with tolTilts = max of the checked tolerances). Calibrate '
+            '(v2)… honours each ± margin independently, so a large Ty '
+            'excursion (e.g. a genuinely tilted detector) no longer '
+            'forces Tz\'s window open too.')
 
         lay.addWidget(QtWidgets.QLabel("Tx (deg)"), 4, 0)
         self.tx_edit = QtWidgets.QLineEdit(str(self.tx_local))
@@ -4678,7 +4681,16 @@ class FFViewer(QtWidgets.QMainWindow):
         # Tolerances — the actual refine flags.
         lines.append(f'tolLsd {_tol("Lsd")}')
         lines.append(f'tolBC {max(_tol("BC_Y"), _tol("BC_Z"))}')
+        # tolTilts: kept as the shared Tx/Ty/Tz window for CalibrantIntegratorOMP
+        # (the C binary — CalibrantIntegratorOMP.c — only has this one knob, so
+        # ty/tz always share it there). tolTy/tolTz are extra, v2-only keys the
+        # C binary ignores; midas_calibrate_v2's LM has no single-knob
+        # constraint, so it honours them independently when present — e.g. a
+        # large Ty excursion (real hardware tilt) no longer forces Tz's window
+        # open too, or vice versa.
         lines.append(f'tolTilts {max(_tol("Tx"), _tol("Ty"), _tol("Tz"))}')
+        lines.append(f'tolTy {_tol("Ty")}')
+        lines.append(f'tolTz {_tol("Tz")}')
         lines.append(f'tolP {_tol("p0")}')
         lines.append(f'tolP1 {_tol("p1")}')
         lines.append(f'tolP2 {_tol("p2")}')

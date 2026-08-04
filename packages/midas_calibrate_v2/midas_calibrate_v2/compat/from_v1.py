@@ -47,8 +47,16 @@ def spec_from_v1_params(v1: V1Params) -> CalibrationSpec:
     _add(s, "BC_y", v1.BC_y, refined=refine.get("BC", True), tol=v1.tolBC)
     _add(s, "BC_z", v1.BC_z, refined=refine.get("BC", True), tol=v1.tolBC)
     _add(s, "tx", v1.tx, refined=False, tol=1e-6)   # v1: tx never refined
-    _add(s, "ty", v1.ty, refined=refine.get("ty", True), tol=v1.tolTilts)
-    _add(s, "tz", v1.tz, refined=refine.get("tz", True), tol=v1.tolTilts)
+    # Per-axis tolTy/tolTz (v2-only) override the shared tolTilts when the
+    # ps.txt specifies one; None means "not specified" and falls back to
+    # tolTilts (mirrors param_vector.py's bounds()). A tolerance of exactly
+    # 0 means the GUI's refine checkbox for that axis was unchecked — treat
+    # it as frozen rather than leaving refined=True with no bounds, which
+    # made the LM fall back to a hardcoded +/-1 degree box and saturate.
+    tol_ty = v1.tolTy if v1.tolTy is not None else v1.tolTilts
+    tol_tz = v1.tolTz if v1.tolTz is not None else v1.tolTilts
+    _add(s, "ty", v1.ty, refined=refine.get("ty", True) and tol_ty > 0, tol=tol_ty)
+    _add(s, "tz", v1.tz, refined=refine.get("tz", True) and tol_tz > 0, tol=tol_tz)
     # Distortion: translate v1's 15 chaotic p₀..p₁₄ into v2's canonical
     # names (3 isotropic + 6 amp/phase pairs).  The v1→v2 mapping is:
     #
