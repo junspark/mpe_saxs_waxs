@@ -6122,13 +6122,125 @@ class FFViewer(QtWidgets.QMainWindow):
         strain_plot = pg.PlotWidget()
         strain_plot.setBackground('w')
         strain_plot.setMinimumHeight(180)
-        strain_plot.setLabel('left', 'Pseudo-strain', units='µɛ')
-        strain_plot.setLabel('bottom', 'E↔M iteration')
+        _axis_label_style = {'font-size': '14pt'}
+        strain_plot.setLabel('left', 'Pseudo-strain', units='µɛ', **_axis_label_style)
+        strain_plot.setLabel('bottom', 'E↔M iteration', **_axis_label_style)
+        _tick_font = QtGui.QFont()
+        _tick_font.setPointSize(12)
+        strain_plot.getAxis('left').setTickFont(_tick_font)
+        strain_plot.getAxis('bottom').setTickFont(_tick_font)
         strain_plot.setLogMode(x=False, y=True)
         strain_plot.showGrid(x=True, y=True, alpha=0.3)
-        strain_plot.addLegend(offset=(-10, 10))
-        strain_plot.setVisible(False)
-        vlay.addWidget(strain_plot)
+        strain_legend = strain_plot.addLegend(offset=(-10, 10))
+        strain_legend.setLabelTextSize('12pt')
+
+        # Ring x azimuth residual heatmap — per-fitted-point breakdown of the
+        # same residual the convergence plot only reduces to mean/median/
+        # trim5%. A bias that's systematic in ring or azimuth is the
+        # signature of a tilt/distance mismatch (e.g. a bad Ty seed); flat,
+        # noise-like residual is a genuinely converged fit. Iteration
+        # selector defaults to best_iter once a run completes.
+        residual_tab = QtWidgets.QWidget()
+        residual_vlay = QtWidgets.QVBoxLayout(residual_tab)
+        residual_iter_row = QtWidgets.QHBoxLayout()
+        residual_iter_row.addWidget(QtWidgets.QLabel("Iteration:"))
+        residual_iter_combo = QtWidgets.QComboBox()
+        residual_iter_row.addWidget(residual_iter_combo)
+        residual_iter_row.addStretch(1)
+        residual_vlay.addLayout(residual_iter_row)
+        residual_plot = pg.PlotWidget()
+        residual_plot.setBackground('w')
+        residual_plot.setMinimumHeight(260)
+        residual_plot.setLabel('left', 'azimuth η', units='deg', **_axis_label_style)
+        residual_plot.setLabel('bottom', 'ring (hkl)', **_axis_label_style)
+        residual_plot.getAxis('left').setTickFont(_tick_font)
+        residual_plot.getAxis('bottom').setTickFont(_tick_font)
+        residual_image = pg.ImageItem()
+        residual_plot.addItem(residual_image)
+        residual_hist = pg.HistogramLUTWidget()
+        residual_hist.setImageItem(residual_image)
+        residual_row = QtWidgets.QHBoxLayout()
+        residual_row.addWidget(residual_plot, 1)
+        residual_row.addWidget(residual_hist)
+        residual_vlay.addLayout(residual_row, 1)
+
+        plot_tabs = QtWidgets.QTabWidget()
+        plot_tabs.addTab(strain_plot, "Convergence")
+        plot_tabs.addTab(residual_tab, "Residual map")
+        plot_tabs.setVisible(False)
+        vlay.addWidget(plot_tabs)
+
+        _calib_result_ref = {'result': None}
+
+        def _build_residual_grid(rec, rt):
+            """(eta rows x ring cols) grid of signed pseudo-strain (µɛ).
+
+            Rows/cols are the sorted unique eta/ring values actually present
+            in ``rec`` — not a fixed canonical grid — so this degrades
+            gracefully when SNR filtering drops different bins per ring.
+            Returns (grid, row_eta_vals, col_labels) or None if rec lacks
+            the per-point breakdown (e.g. an older/incompatible result).
+            """
+            if rec is None or rec.residuals_uE is None or rec.ring_idx is None \
+                    or rec.eta_deg is None:
+                return None
+            residuals = rec.residuals_uE.detach().cpu().numpy()
+            ring_idx = rec.ring_idx.detach().cpu().numpy()
+            eta = rec.eta_deg.detach().cpu().numpy()
+            if residuals.size == 0:
+                return None
+            rows = np.unique(eta)
+            cols = np.unique(ring_idx)
+            row_pos = {v: i for i, v in enumerate(rows)}
+            col_pos = {v: i for i, v in enumerate(cols)}
+            grid = np.full((rows.size, cols.size), np.nan, dtype=np.float64)
+            for r, ri, e in zip(residuals, ring_idx, eta):
+                grid[row_pos[e], col_pos[ri]] = r
+            col_labels = []
+            for ri in cols:
+                ri = int(ri)
+                if rt is not None and 0 <= ri < len(rt.ring_nr):
+                    col_labels.append(
+                        f"{int(rt.ring_nr[ri])}\n({int(rt.h[ri])}{int(rt.k[ri])}{int(rt.l[ri])})")
+                else:
+                    col_labels.append(str(ri))
+            return grid, rows, col_labels
+
+        def _draw_residual_map(idx):
+            result = _calib_result_ref['result']
+            if result is None or not (0 <= idx < len(result.history)):
+                return
+            try:
+                rt = result.fits_final.rt if result.fits_final is not None else None
+                built = _build_residual_grid(result.history[idx], rt)
+                if built is None:
+                    residual_image.clear()
+                    return
+                grid, rows, col_labels = built
+                # pg.ImageItem indexes as [col, row] (x-major); transpose so
+                # our (eta-row, ring-col) grid maps to (ring-x, eta-y).
+                residual_image.setImage(grid.T, autoLevels=False)
+                finite = grid[np.isfinite(grid)]
+                vmax = float(np.max(np.abs(finite))) if finite.size else 1.0
+                vmax = max(vmax, 1e-6)
+                residual_image.setLevels((-vmax, vmax))
+                cmap = get_colormap('RdBu_r')
+                residual_image.setLookupTable(cmap.getLookupTable(nPts=256))
+                if hasattr(residual_hist, 'gradient'):
+                    try:
+                        residual_hist.gradient.setColorMap(cmap)
+                    except Exception:
+                        pass
+                if rows.size:
+                    residual_image.setRect(QtCore.QRectF(
+                        -0.5, float(rows.min()), len(col_labels),
+                        float(rows.max() - rows.min()) or 1.0))
+                residual_plot.getAxis('bottom').setTicks(
+                    [[(i, lbl) for i, lbl in enumerate(col_labels)]])
+            except Exception as _e:
+                print(f'residual-map render error: {_e}')
+
+        residual_iter_combo.currentIndexChanged.connect(_draw_residual_map)
 
         btn_row = QtWidgets.QHBoxLayout()
         cancel_btn = QtWidgets.QPushButton("Cancel")
@@ -6288,11 +6400,32 @@ class FFViewer(QtWidgets.QMainWindow):
                             pen=pg.mkPen('#888', width=1, style=QtCore.Qt.DashLine),
                             label=f'best iter {best_i}',
                             labelOpts={'position': 0.9, 'color': '#555',
-                                       'movable': False})
+                                       'movable': False, 'font-size': '12pt'})
                         strain_plot.addItem(vline)
-                    strain_plot.setVisible(True)
+                    plot_tabs.setVisible(True)
                 except Exception as _e:
                     print(f'strain-plot render error: {_e}')
+
+                # Populate the residual-map tab's iteration selector and
+                # draw the default (best-iter) grid.
+                try:
+                    _calib_result_ref['result'] = result
+                    residual_iter_combo.blockSignals(True)
+                    residual_iter_combo.clear()
+                    best_i = getattr(result, 'best_iter', None)
+                    default_idx = 0
+                    for i, h in enumerate(result.history):
+                        label = f'{h.iteration}'
+                        if best_i is not None and h.iteration == best_i:
+                            label += ' (best)'
+                            default_idx = i
+                        residual_iter_combo.addItem(label)
+                    residual_iter_combo.blockSignals(False)
+                    if result.history:
+                        residual_iter_combo.setCurrentIndex(default_idx)
+                        _draw_residual_map(default_idx)
+                except Exception as _e:
+                    print(f'residual-map populate error: {_e}')
 
                 # ── Before / After table ── seed vs refined values for
                 # every panel-visible parameter, with delta. Makes it

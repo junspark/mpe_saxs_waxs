@@ -37,6 +37,7 @@ class FittedPoint:
     Z_pix: float
     ring_idx: int      # index into RingTable
     snr: float = 1.0
+    eta_deg: float = 0.0   # azimuth of the cake bin this point was fit from
 
 
 @dataclass

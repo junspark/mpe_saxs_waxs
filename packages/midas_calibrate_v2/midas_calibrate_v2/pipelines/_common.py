@@ -62,6 +62,7 @@ class FittedDataset:
     weights: Optional[torch.Tensor] = None
     panel_idx: Optional[torch.Tensor] = None
     rt: Optional[RingTable] = None
+    eta_deg: Optional[torch.Tensor] = None   # [n_pts] azimuth of each fitted point
     # Per-fit ring d-spacing (Å); when populated AND Wavelength is in the
     # spec, pseudo_strain_residual recomputes 2θ inside via Bragg so the
     # autograd chain through λ stays unbroken.  Pinned-Wavelength callers
@@ -86,6 +87,7 @@ def run_estep_v1(
     Z = torch.tensor([p.Z_pix for p in fits], dtype=dtype, device=device)
     rid = torch.tensor([p.ring_idx for p in fits], dtype=torch.long, device=device)
     snr = torch.tensor([p.snr for p in fits], dtype=dtype, device=device)
+    eta = torch.tensor([p.eta_deg for p in fits], dtype=dtype, device=device)
 
     rt_tt = torch.tensor(rt.two_theta_deg, dtype=dtype, device=device)
     rtt_per_pt = rt_tt[rid]
@@ -105,7 +107,7 @@ def run_estep_v1(
         Y_pix=Y, Z_pix=Z, ring_idx=rid, snr=snr,
         ring_two_theta_deg=rtt_per_pt,
         rho_d=torch.as_tensor(rho_d, dtype=dtype, device=device),
-        weights=w, rt=rt,
+        weights=w, rt=rt, eta_deg=eta,
     )
 
 
