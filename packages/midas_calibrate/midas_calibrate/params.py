@@ -51,6 +51,12 @@ class CalibrationParams:
     LatticeConstant: Tuple[float, float, float, float, float, float] = (0, 0, 0, 90, 90, 90)
     MaxRingRad: float = 0.0      # px
     MinRingRad: float = 0.0      # px
+    # Lamellar SAXS calibrants (e.g. silver behenate) have no useful
+    # crystallographic space group — they're characterised by their
+    # d-spacings directly. When non-empty, build_ring_table() derives rings
+    # from these via Bragg's law instead of SpaceGroup/LatticeConstant,
+    # mirroring CalibrantIntegratorOMP.c's DSpacing bypass of GetHKLList.
+    DSpacings: List[float] = field(default_factory=list)   # Å
 
     # ----------------------------------------------- E-step binning
     Width: float = 800.0           # μm; ring half-width
@@ -142,6 +148,8 @@ class CalibrationParams:
                 vals = [float(v) for v in val.split()]
                 if len(vals) >= 6:
                     params.LatticeConstant = tuple(vals[:6])  # type: ignore
+            elif key == "DSpacing":
+                params.DSpacings.append(float(val.split()[0]))
             elif key == "MaxRingRad":
                 params.MaxRingRad = float(val.split()[0])
             elif key == "MinRingRad":
@@ -232,8 +240,12 @@ class CalibrationParams:
         lines.append(f"NrPixelsY {self.NrPixelsY}")
         lines.append(f"NrPixelsZ {self.NrPixelsZ}")
         lines.append(f"RhoD {self.RhoD:.6f}")
-        lines.append(f"SpaceGroup {self.SpaceGroup}")
-        lines.append("LatticeConstant " + " ".join(f"{v:.6f}" for v in self.LatticeConstant))
+        if self.DSpacings:
+            for d in self.DSpacings:
+                lines.append(f"DSpacing {d:.6f}")
+        else:
+            lines.append(f"SpaceGroup {self.SpaceGroup}")
+            lines.append("LatticeConstant " + " ".join(f"{v:.6f}" for v in self.LatticeConstant))
         for k, v in self.extra.items():
             lines.append(f"{k} {v}")
         return "\n".join(lines) + "\n"
@@ -249,7 +261,7 @@ class CalibrationParams:
             raise ValueError("pxY (pixel size) must be positive")
         if self.Wavelength <= 0:
             raise ValueError("Wavelength must be positive")
-        if self.SpaceGroup < 1 or self.SpaceGroup > 230:
+        if not self.DSpacings and (self.SpaceGroup < 1 or self.SpaceGroup > 230):
             raise ValueError(f"SpaceGroup must be in [1, 230]; got {self.SpaceGroup}")
         if self.NrPixelsY <= 0 or self.NrPixelsZ <= 0:
             raise ValueError("Detector pixel counts must be positive")
